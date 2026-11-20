@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-auto-date-rename",
+  "name": "Auto Date Rename",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Automatically renames newly created Markdown notes to a local date-and-time filename.",
+  "author": "Custom local plugin",
+  "isDesktopOnly": false
+}
