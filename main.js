@@ -1,8 +1,10 @@
 'use strict';
 
-const { Plugin, PluginSettingTab, Setting, TFile, moment } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, TFile, moment, normalizePath } = require('obsidian');
 
 const DEFAULT_FILENAME_FORMAT = 'YYYY-MM-DD_HH-mm-ss-SSS';
+const MAX_BASENAME_BYTES = 247; // 255 bytes minus ".md" and "-9999".
+const utf8 = new TextEncoder();
 
 function pad(number, width = 2) {
   return String(number).padStart(width, '0');
@@ -24,22 +26,32 @@ function normalizeFormat(format) {
   return (typeof format === 'string' && format.trim()) || DEFAULT_FILENAME_FORMAT;
 }
 
-function formatFilename(date, format) {
-  if (format === DEFAULT_FILENAME_FORMAT) return formatLocalDateTime(date);
-  return moment(date).format(format).normalize('NFC');
+function getFormattedFilename(date, format) {
+  const rawName = format === DEFAULT_FILENAME_FORMAT
+    ? formatLocalDateTime(date)
+    : moment(date).format(format);
+  if (/[<>:"/\\|?*#^\[\]\u0000-\u001f]|%%/.test(rawName)) {
+    return {
+      name: rawName,
+      error: 'The filename contains characters that are unsafe in file paths or Obsidian links.',
+    };
+  }
+
+  const name = normalizePath(rawName);
+  return { name, error: getFilenameError(name) };
 }
 
 function getFilenameError(name) {
-  if (!name.trim()) return 'The filename cannot be empty.';
+  if (name === '/' || !name.trim()) return 'The filename cannot be empty.';
   if (name.trimStart().startsWith('.')) return 'The filename cannot start with a period.';
-  if (/[<>:"/\\|?*#^\[\]\u0000-\u001f]|%%/.test(name)) {
-    return 'The filename contains characters that are unsafe in file paths or Obsidian links.';
-  }
   if (/[. ]$/.test(name)) return 'The filename cannot end with a space or period.';
 
   const deviceName = name.split('.', 1)[0].trimEnd();
   if (/^(?:con|prn|aux|nul|(?:com|lpt)[1-9¹²³])$/i.test(deviceName)) {
     return 'The filename is reserved on Windows.';
+  }
+  if (utf8.encode(name).length > MAX_BASENAME_BYTES) {
+    return `Shorten the format to keep the base filename within ${MAX_BASENAME_BYTES} UTF-8 bytes.`;
   }
   return '';
 }
@@ -79,8 +91,7 @@ class AutoDateRenameSettingTab extends PluginSettingTab {
     const preview = containerEl.createDiv();
     const status = containerEl.createDiv({ attr: { role: 'status' } });
     this.updatePreview = () => {
-      const name = formatFilename(new Date(), normalizeFormat(this.draft));
-      const error = getFilenameError(name);
+      const { name, error } = getFormattedFilename(new Date(), normalizeFormat(this.draft));
       preview.textContent = `Preview: ${name}.md`;
       status.textContent = error || this.feedback;
       input.inputEl.setAttribute('aria-invalid', String(Boolean(error)));
@@ -94,7 +105,7 @@ class AutoDateRenameSettingTab extends PluginSettingTab {
     if (this.saving || this.plugin.loadToken !== this.loadToken) return;
 
     const filenameFormat = normalizeFormat(this.draft);
-    if (getFilenameError(formatFilename(new Date(), filenameFormat))) {
+    if (getFormattedFilename(new Date(), filenameFormat).error) {
       this.updatePreview();
       return;
     }
@@ -177,13 +188,13 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
     const folder = file.parent && file.parent.path !== '/' ? file.parent.path : '';
     const { ctime } = file.stat;
     const date = new Date(Number.isFinite(ctime) && ctime > 0 ? ctime : Date.now());
-    const formattedName = formatFilename(date, filenameFormat);
-    const baseName = getFilenameError(formattedName) ? formatLocalDateTime(date) : formattedName;
+    const { name, error } = getFormattedFilename(date, filenameFormat);
+    const baseName = error ? formatLocalDateTime(date) : name;
 
     // If several notes are created simultaneously, suffix the duplicates.
     for (let index = 0; index < 10000; index++) {
       const suffix = index === 0 ? '' : `-${pad(index, 2)}`;
-      const candidate = `${folder ? folder + '/' : ''}${baseName}${suffix}.md`;
+      const candidate = normalizePath(`${folder ? folder + '/' : ''}${baseName}${suffix}.md`);
       if (candidate === file.path) return;
       if (this.app.vault.getAbstractFileByPath(candidate) !== null) continue;
       await this.app.fileManager.renameFile(file, candidate);

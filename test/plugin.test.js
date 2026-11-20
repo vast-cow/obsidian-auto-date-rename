@@ -8,6 +8,13 @@ const { setImmediate: flushQueue } = require('node:timers/promises');
 const { runInNewContext } = require('node:vm');
 
 const source = readFileSync(join(__dirname, '../main.js'), 'utf8');
+const creationTime = new Date(2026, 10, 20, 12, 1, 30, 123).getTime();
+const defaultFilename = '2026-11-20_12-01-30-123.md';
+
+function normalizePath(path) {
+  const normalized = path.replace(/[\\/]+/g, '/').replace(/^\/|\/$/g, '');
+  return (normalized || '/').replace(/\u00a0/g, ' ').normalize('NFC');
+}
 
 class Plugin {
   subscriptions = [];
@@ -44,6 +51,8 @@ class TFile {
   constructor(path) {
     this.path = path;
     this.extension = path.split('.').at(-1);
+    this.parent = { path: path.slice(0, path.lastIndexOf('/') + 1).replace(/\/$/, '') || '/' };
+    this.stat = { ctime: creationTime };
   }
 }
 
@@ -101,6 +110,7 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }) {
   const module = {};
   runInNewContext(source, {
     module,
+    TextEncoder,
     require(name) {
       assert.equal(name, 'obsidian');
       return {
@@ -108,6 +118,7 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }) {
         PluginSettingTab,
         Setting,
         TFile,
+        normalizePath,
         moment: () => ({ format: (format) => format.replace(/\[([^\]]*)\]/g, '$1') }),
       };
     },
@@ -116,6 +127,8 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }) {
 
   const layoutCallbacks = [];
   const createListeners = new Set();
+  const files = new Map();
+  const renamedPaths = [];
   let layoutReady = false;
   const app = {
     workspace: {
@@ -130,17 +143,31 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }) {
         createListeners.add(callback);
         return () => createListeners.delete(callback);
       },
+      getAbstractFileByPath(path) {
+        return files.get(path) ?? null;
+      },
+    },
+    fileManager: {
+      async renameFile(file, path) {
+        assert.equal(path, normalizePath(path));
+        assert.equal(files.has(path), false, `Cannot overwrite ${path}`);
+        files.delete(file.path);
+        file.path = path;
+        files.set(path, file);
+        renamedPaths.push(path);
+      },
     },
   };
   const plugin = new module.exports(app, storage);
   return {
-    plugin, storage, errors, createListeners,
+    plugin, storage, errors, createListeners, renamedPaths,
     finishLayout() {
       layoutReady = true;
       for (const callback of layoutCallbacks.splice(0)) callback();
     },
     create(path) {
       const file = new TFile(path);
+      files.set(path, file);
       for (const callback of createListeners) callback(file);
       return file;
     },
@@ -339,3 +366,93 @@ function deferred() {
   const promise = new Promise((resolvePromise) => { resolve = resolvePromise; });
   return { promise, resolve };
 }
+
+test('uses the normalized preview name on disk and numbers collisions', async () => {
+  const { plugin, create, finishLayout, renamedPaths, errors } = setup();
+  const ui = await openSettings(plugin);
+  ui.input.change('[New\u00a0Note]');
+  assert.equal(ui.children[0].textContent, 'Preview: New Note.md');
+  await ui.button.click();
+
+  finishLayout();
+  const first = create('Inbox/Untitled.md');
+  const second = create('Inbox/Untitled 1.md');
+  const third = create('Inbox/Untitled 2.md');
+  await flushQueue();
+  assert.deepEqual([first.path, second.path, third.path], [
+    'Inbox/New Note.md', 'Inbox/New Note-01.md', 'Inbox/New Note-02.md',
+  ]);
+  assert.equal(renamedPaths.length, 3);
+  assert.deepEqual(errors, []);
+});
+
+test('skips renaming a note that already has the normalized name', async () => {
+  const storage = { data: { filenameFormat: '[New\u00a0Note]' } };
+  const { plugin, create, finishLayout, renamedPaths } = setup(storage);
+  await plugin.onload();
+  finishLayout();
+  const note = create('Inbox/New Note.md');
+  await flushQueue();
+
+  assert.equal(note.path, 'Inbox/New Note.md');
+  assert.deepEqual(renamedPaths, []);
+});
+
+test('rejects raw separators that normalizePath would remove', async () => {
+  const storage = { data: { filenameFormat: '[New/]' } };
+  const { plugin, create, finishLayout } = setup(storage);
+  const ui = await openSettings(plugin);
+  for (const draft of ['[New/]', '[New\\]']) {
+    ui.input.change(draft);
+    assert.equal(ui.button.disabled, true);
+    assert.match(ui.children[1].textContent, /unsafe/);
+  }
+
+  finishLayout();
+  const note = create('Inbox/Untitled.md');
+  await flushQueue();
+  assert.equal(note.path, `Inbox/${defaultFilename}`);
+});
+
+test('accepts 247 normalized UTF-8 bytes with room for the longest suffix', async () => {
+  const { plugin, create, finishLayout } = setup();
+  const ui = await openSettings(plugin);
+  const raw = 'e\u0301'.repeat(123) + 'x';
+  const base = 'é'.repeat(123) + 'x';
+  assert.equal(Buffer.byteLength(base), 247);
+  ui.input.change(`[${raw}]`);
+  assert.equal(ui.children[0].textContent, `Preview: ${base}.md`);
+  assert.equal(ui.button.disabled, false);
+  await ui.button.click();
+
+  create(`Inbox/${base}.md`);
+  for (let index = 1; index < 9999; index++) {
+    create(`Inbox/${base}-${String(index).padStart(2, '0')}.md`);
+  }
+  finishLayout();
+  const note = create('Inbox/Untitled.md');
+  await flushQueue();
+
+  assert.equal(note.path, `Inbox/${base}-9999.md`);
+  assert.equal(Buffer.byteLength(note.path.split('/').at(-1)), 255);
+});
+
+test('blocks a 248-byte draft and falls back when that format is already stored', async () => {
+  const oversized = `[${'é'.repeat(124)}]`;
+  const storage = { data: { filenameFormat: '[Old]' } };
+  const ui = await openSettings(setup(storage).plugin);
+  ui.input.change(oversized);
+  assert.equal(ui.button.disabled, true);
+  assert.match(ui.children[1].textContent, /Shorten the format.*247 UTF-8 bytes/);
+  await ui.button.click();
+  assert.deepEqual(storage.data, { filenameFormat: '[Old]' });
+
+  storage.data = { filenameFormat: oversized };
+  const { plugin, create, finishLayout } = setup(storage);
+  await plugin.onload();
+  finishLayout();
+  const note = create('Inbox/Untitled.md');
+  await flushQueue();
+  assert.equal(note.path, `Inbox/${defaultFilename}`);
+  assert.deepEqual(storage.data, { filenameFormat: oversized });
+});

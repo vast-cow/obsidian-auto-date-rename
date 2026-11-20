@@ -37,6 +37,8 @@ Open **Settings → Auto Date Rename**, enter a Moment.js format in **File name 
 - `YYYY-MM-DD` produces `2026-11-20.md`.
 - `YYYYMMDD_HHmm` produces `20261120_1201.md`.
 
+The normalized base filename can be up to **247 UTF-8 bytes**, leaving room for `.md` and a collision suffix as long as `-9999` within the 255-byte filename limit. If a saved format produces a longer name, the plugin uses the default format for that note.
+
 To restore the default `YYYY-MM-DD_HH-mm-ss-SSS`, clear the field and click **Save**.
 
 ## Notes
