@@ -30,6 +30,15 @@ Folder structure:
 - Applies to new Markdown notes created by templates or other plugins. File additions via synchronization or external apps may also be detected as "newly created."
 - Uses the file's `ctime` for the date and time and displays it in the local time of the device running Obsidian. For files brought in via synchronization, this value may differ from the current time.
 
+## File name format
+
+Open **Settings → Auto Date Rename**, enter a Moment.js format in **File name format**, and check the `.md` preview. Click **Save** to apply the format to new Markdown notes. See the [Moment.js format tokens](https://momentjs.com/docs/#/displaying/format/).
+
+- `YYYY-MM-DD` produces `2026-11-20.md`.
+- `YYYYMMDD_HHmm` produces `20261120_1201.md`.
+
+To restore the default `YYYY-MM-DD_HH-mm-ss-SSS`, clear the field and click **Save**.
+
 ## Notes
 
 Please test the plugin in a test vault first. There is no function to rename existing notes in bulk. The behavior regarding new file events and conflicts with other plugins may vary depending on your environment.
