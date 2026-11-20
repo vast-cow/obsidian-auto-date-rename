@@ -259,7 +259,7 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
       if (candidate === sourcePath) return;
       if (this.renameReservations.has(pathKey(candidate))) continue;
 
-      const occupied = await this.destinationIsOccupied(file, sourcePath, candidate, folder);
+      const occupied = await this.destinationIsOccupied(file, sourcePath, candidate);
       if (!sourceIsCurrent()) return;
       if (occupied) continue;
 
@@ -268,7 +268,7 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
         return;
       } catch (error) {
         if (!sourceIsCurrent()) return;
-        const collided = await this.destinationIsOccupied(file, sourcePath, candidate, folder);
+        const collided = await this.destinationIsOccupied(file, sourcePath, candidate);
         if (!sourceIsCurrent()) return;
         if (!collided) throw error;
       }
@@ -276,7 +276,7 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
     console.warn('[Auto Date Rename] Could not find an unused filename for:', file.path);
   }
 
-  async destinationIsOccupied(file, sourcePath, candidate, folder) {
+  async destinationIsOccupied(file, sourcePath, candidate) {
     const { vault } = this.app;
     const key = pathKey(candidate);
     const indexedCollision = () => {
@@ -286,15 +286,11 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
     };
     if (indexedCollision()) return true;
 
-    const exists = await vault.adapter.exists(candidate);
-    if (exists && key !== pathKey(sourcePath)) return true;
-
-    // Check disk entries that the vault has yet to index, including on case-sensitive disks.
-    const { files, folders } = await vault.adapter.list(folder || '/');
-    const entries = files.concat(folders).map(normalizePath);
-    const source = normalizePath(sourcePath);
-    return indexedCollision() || entries.some((path) => path !== source && pathKey(path) === key) ||
-      (exists && !entries.includes(source));
+    if (await vault.adapter.exists(candidate)) {
+      // A case-insensitive filesystem can report the source under the destination spelling.
+      if (key !== pathKey(sourcePath) || await vault.adapter.exists(candidate, true)) return true;
+    }
+    return indexedCollision();
   }
 
   waitForRename(file, sourcePath, candidate) {
@@ -318,18 +314,17 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
       const deleteRef = vault.on('delete', (deleted) => {
         if (deleted === file) release();
       });
-      let timedOut = false;
       const timeout = setTimeout(() => {
-        timedOut = true;
         console.warn('[Auto Date Rename] Could not confirm rename within 10 seconds:', sourcePath, candidate);
-        // Keep the destination reserved until the source moves, is deleted, or the plugin unloads.
+        // Advance the queue while keeping the destination reserved until the attempt is resolved.
         resolve();
       }, RENAME_TIMEOUT_MS);
       reservations.set(key, release);
 
       const onError = (error) => {
-        if (timedOut || reservations.get(key) !== release) return;
+        if (reservations.get(key) !== release) return;
         cleanup();
+        // The queue promise has already settled if this rejection arrived after the timeout.
         reject(error);
       };
       try {

@@ -591,30 +591,63 @@ test('the burst waits for a visible move and continues while link updates are pe
   assert.deepEqual(errors, []);
 });
 
-test('suffixes case-insensitive index and disk-only matches', async () => {
+test('suffixes case-insensitive indexed matches and exact disk-only matches', async () => {
   const { plugin, create, disk, finishLayout } = setup();
   await plugin.onload();
   const existing = create('Inbox/OLD.md');
-  disk.add('Inbox/OLD-01.md');
+  disk.add('Inbox/Old-01.md');
   const adapter = plugin.app.vault.adapter;
   const exists = adapter.exists;
-  adapter.exists = (path) => path === 'Inbox/Old-02.md' || exists(path);
+  adapter.exists = (path, sensitive) => {
+    assert.equal(sensitive, undefined);
+    return exists(path);
+  };
   finishLayout();
   const note = create('Inbox/Untitled.md');
   await flushQueue();
-  assert.equal(note.path, 'Inbox/Old-03.md');
+  assert.equal(note.path, 'Inbox/Old-02.md');
   assert.equal(existing.path, 'Inbox/OLD.md');
-  assert.ok(disk.has('Inbox/OLD-01.md'));
+  assert.ok(disk.has('Inbox/Old-01.md'));
 });
 
-test('allows a case-only rename of the source when the disk reports that spelling exists', async () => {
-  const { plugin, create, finishLayout } = setup();
+test('renames notes in a folder whose listing fails due to an unrelated broken symlink', async () => {
+  const { plugin, create, finishLayout, errors } = setup();
   await plugin.onload();
-  plugin.app.vault.adapter.exists = async () => true;
+  const adapter = plugin.app.vault.adapter;
+  adapter.list = async () => {
+    throw Object.assign(new Error('Missing target for Inbox/Unrelated.png'), { code: 'ENOENT' });
+  };
   finishLayout();
-  const note = create('Inbox/OLD.md');
+  const first = create('Inbox/Untitled.md');
+  const second = create('Inbox/Untitled 1.md');
   await flushQueue();
-  assert.equal(note.path, 'Inbox/Old.md');
+  assert.deepEqual([first.path, second.path], ['Inbox/Old.md', 'Inbox/Old-01.md']);
+  assert.deepEqual(errors, []);
+});
+
+test('uses a case-sensitive check to distinguish the source from a case-only destination', async () => {
+  for (const destinationExists of [false, true]) {
+    const { plugin, create, disk, finishLayout } = setup();
+    await plugin.onload();
+    if (destinationExists) disk.add('Inbox/Old.md');
+    const adapter = plugin.app.vault.adapter;
+    const exists = adapter.exists;
+    const checks = [];
+    adapter.exists = (path, sensitive) => {
+      checks.push([path, sensitive]);
+      return path === 'Inbox/Old.md' && !sensitive ? Promise.resolve(true) : exists(path);
+    };
+    finishLayout();
+    const note = create('Inbox/OLD.md');
+    await flushQueue();
+    assert.equal(note.path, destinationExists ? 'Inbox/Old-01.md' : 'Inbox/Old.md');
+    assert.deepEqual(checks, [
+      ['Inbox/Old.md', undefined],
+      ['Inbox/Old.md', true],
+      ...(destinationExists ? [['Inbox/Old-01.md', undefined]] : []),
+    ]);
+    assert.ok(disk.has('Inbox/Old.md'));
+  }
 });
 
 test('retries when a rejected rename encounters a newly occupied destination', async () => {
@@ -623,7 +656,7 @@ test('retries when a rejected rename encounters a newly occupied destination', a
   plugin.app.fileManager.renameFile = async (file, path) => {
     calls.push(path);
     if (calls.length === 1) {
-      disk.add('OLD.md');
+      disk.add('Old.md');
       throw new Error('Destination file already exists');
     }
     move(file, path);
@@ -659,8 +692,6 @@ test('a timeout advances the queue and reserves the destination until the source
     assert.equal(listeners.rename.size, 1);
     assert.equal(listeners.delete.size, 1);
 
-    delayed.reject(new Error('late rename rejection'));
-    await flushQueue();
     if (change === 'move') move(first, 'Moved.md');
     else remove(first);
     const third = create('Third.md');
@@ -670,6 +701,35 @@ test('a timeout advances the queue and reserves the destination until the source
     assert.equal(listeners.rename.size, 0);
     assert.equal(listeners.delete.size, 0);
   }
+});
+
+test('a rejection after timeout releases the destination and both listeners', async () => {
+  const { plugin, create, move, expireRename, finishLayout, listeners, errors } = setup();
+  const delayed = deferred();
+  plugin.app.fileManager.renameFile = async (file, path) => {
+    if (file.path === 'Delayed.md') return delayed.promise;
+    move(file, path);
+  };
+  await plugin.onload();
+  finishLayout();
+  const first = create('Delayed.md');
+  await flushQueue();
+  expireRename();
+  const second = create('Second.md');
+  await flushQueue();
+  assert.equal(second.path, 'Old-01.md');
+  assert.equal(listeners.rename.size, 1);
+  assert.equal(listeners.delete.size, 1);
+
+  delayed.reject(new Error('late rename rejection'));
+  await flushQueue();
+  assert.equal(listeners.rename.size, 0);
+  assert.equal(listeners.delete.size, 0);
+  const third = create('Third.md');
+  await flushQueue();
+  assert.equal(first.path, 'Delayed.md');
+  assert.equal(third.path, 'Old.md');
+  assert.deepEqual(errors, []);
 });
 
 test('unload releases pending and timed-out renames and discards the queued notes', async () => {
