@@ -102,7 +102,14 @@ class AutoDateRenameSettingTab extends PluginSettingTab {
     this.feedback = '';
     this.updatePreview();
     try {
-      await this.plugin.saveData({ filenameFormat });
+      const stored = await this.plugin.loadData();
+      if (stored?.filenameFormat !== filenameFormat) {
+        await this.plugin.saveData({ filenameFormat });
+        const saved = await this.plugin.loadData();
+        if (saved?.filenameFormat !== filenameFormat) {
+          throw new Error('The stored file name format did not match the requested format.');
+        }
+      }
       this.plugin.filenameFormat = filenameFormat;
       this.feedback = 'File name format saved.';
     } catch (error) {
