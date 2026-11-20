@@ -45,9 +45,10 @@ function getFilenameError(name) {
 }
 
 class AutoDateRenameSettingTab extends PluginSettingTab {
-  constructor(plugin) {
+  constructor(plugin, loadToken) {
     super(plugin.app, plugin);
     this.plugin = plugin;
+    this.loadToken = loadToken;
     this.draft = plugin.filenameFormat;
     this.feedback = '';
     this.saving = false;
@@ -90,7 +91,7 @@ class AutoDateRenameSettingTab extends PluginSettingTab {
   }
 
   async save() {
-    if (this.saving) return;
+    if (this.saving || this.plugin.loadToken !== this.loadToken) return;
 
     const filenameFormat = normalizeFormat(this.draft);
     if (getFilenameError(formatFilename(new Date(), filenameFormat))) {
@@ -103,9 +104,12 @@ class AutoDateRenameSettingTab extends PluginSettingTab {
     this.updatePreview();
     try {
       const stored = await this.plugin.loadData();
+      if (this.plugin.loadToken !== this.loadToken) return;
       if (stored?.filenameFormat !== filenameFormat) {
         await this.plugin.saveData({ filenameFormat });
+        if (this.plugin.loadToken !== this.loadToken) return;
         const saved = await this.plugin.loadData();
+        if (this.plugin.loadToken !== this.loadToken) return;
         if (saved?.filenameFormat !== filenameFormat) {
           throw new Error('The stored file name format did not match the requested format.');
         }
@@ -113,35 +117,57 @@ class AutoDateRenameSettingTab extends PluginSettingTab {
       this.plugin.filenameFormat = filenameFormat;
       this.feedback = 'File name format saved.';
     } catch (error) {
+      if (this.plugin.loadToken !== this.loadToken) return;
       this.feedback = 'Could not save the file name format. The previous format is still active.';
       console.error('[Auto Date Rename] Could not save the file name format:', error);
     } finally {
       this.saving = false;
-      this.updatePreview();
+      if (this.plugin.loadToken === this.loadToken) this.updatePreview();
     }
   }
 }
 
 module.exports = class AutoDateRenamePlugin extends Plugin {
   async onload() {
+    const loadToken = Symbol();
+    this.loadToken = loadToken;
+    this.filenameFormat = undefined;
     // Process one event at a time to avoid conflicting filenames.
-    this.renameQueue = Promise.resolve();
-
-    const data = await this.loadData();
-    this.filenameFormat = normalizeFormat(data?.filenameFormat);
-    this.addSettingTab(new AutoDateRenameSettingTab(this));
+    let renameQueue = Promise.resolve();
+    const settingsReady = this.loadData()
+      .then((data) => normalizeFormat(data?.filenameFormat))
+      .catch((error) => {
+        if (this.loadToken === loadToken) {
+          console.error('[Auto Date Rename] Could not load the file name format:', error);
+        }
+        return DEFAULT_FILENAME_FORMAT;
+      });
 
     // During vault initialization Obsidian emits "create" for existing files.
     // Registering after the layout is ready prevents accidental mass renaming.
     this.app.workspace.onLayoutReady(() => {
+      if (this.loadToken !== loadToken) return;
       this.registerEvent(this.app.vault.on('create', (file) => {
+        if (this.loadToken !== loadToken) return;
         if (!(file instanceof TFile) || file.extension !== 'md') return;
         const filenameFormat = this.filenameFormat;
-        this.renameQueue = this.renameQueue
-          .then(() => this.renameNewNote(file, filenameFormat))
-          .catch((error) => console.error('[Auto Date Rename] Could not rename note:', error));
+        renameQueue = renameQueue.then(async () => {
+          if (this.loadToken !== loadToken) return;
+          const format = filenameFormat ?? await settingsReady;
+          if (this.loadToken !== loadToken) return;
+          await this.renameNewNote(file, format);
+        }).catch((error) => console.error('[Auto Date Rename] Could not rename note:', error));
       }));
     });
+
+    const filenameFormat = await settingsReady;
+    if (this.loadToken !== loadToken) return;
+    this.filenameFormat = filenameFormat;
+    this.addSettingTab(new AutoDateRenameSettingTab(this, loadToken));
+  }
+
+  onunload() {
+    this.loadToken = undefined;
   }
 
   async renameNewNote(file, filenameFormat = this.filenameFormat) {
