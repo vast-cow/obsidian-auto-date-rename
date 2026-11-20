@@ -10,6 +10,10 @@ const { runInNewContext } = require('node:vm');
 const source = readFileSync(join(__dirname, '../main.js'), 'utf8');
 const creationTime = new Date(2026, 10, 20, 12, 1, 30, 123).getTime();
 const defaultFilename = '2026-11-20_12-01-30-123.md';
+const pluginId = 'obsidian-auto-date-rename';
+const pluginDir = `custom-config/plugins/${pluginId}`;
+const recoveryPath = `${pluginDir}/data.recovery.json`;
+const oldRecovery = JSON.stringify({ filenameFormat: '[Old]' });
 
 function normalizePath(path) {
   const normalized = path.replace(/[\\/]+/g, '/').replace(/^\/|\/$/g, '');
@@ -22,10 +26,12 @@ class Plugin {
   constructor(app, storage) {
     this.app = app;
     this.storage = storage;
+    this.manifest = { id: pluginId, dir: pluginDir };
   }
 
   async loadData() {
-    return structuredClone(this.storage.data);
+    const { data } = this.storage;
+    return typeof data === 'string' ? JSON.parse(data) : structuredClone(data);
   }
 
   async saveData(data) {
@@ -174,13 +180,28 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }) {
       },
     },
     vault: {
+      configDir: 'custom-config',
       adapter: {
-        async exists(path) { return disk.has(path); },
+        async exists(path) {
+          return path === recoveryPath ? storage.recovery !== undefined : disk.has(path);
+        },
         async list(folder) {
           return {
             files: [...disk].filter((path) => parentPath(path) === folder),
             folders: [],
           };
+        },
+        async read(path) {
+          assert.equal(path, recoveryPath);
+          return storage.recovery;
+        },
+        async write(path, content) {
+          assert.equal(path, recoveryPath);
+          storage.recovery = content;
+        },
+        async remove(path) {
+          assert.equal(path, recoveryPath);
+          delete storage.recovery;
         },
       },
       on(event, callback) {
@@ -240,6 +261,7 @@ test('applies a confirmed save and loads it on the next enable', async () => {
   await ui.button.click();
 
   assert.deepEqual(storage.data, { filenameFormat: '[New]' });
+  assert.equal(storage.recovery, undefined);
   assert.equal(plugin.filenameFormat, '[New]');
   assert.equal(ui.children[1].textContent, 'File name format saved.');
   const reopened = await openSettings(setup(storage).plugin);
@@ -267,10 +289,12 @@ test('retains the active format and allows retry after a rejected write', async 
   await ui.button.click();
   assertSaveFailed(plugin, ui, errors);
   assert.deepEqual(storage.data, { filenameFormat: '[Old]' });
+  assert.equal(storage.recovery, oldRecovery);
 
   plugin.saveData = Plugin.prototype.saveData;
   await ui.button.click();
   assert.equal(plugin.filenameFormat, '[New]');
+  assert.equal(storage.recovery, undefined);
   assert.equal(ui.children[1].textContent, 'File name format saved.');
 });
 
@@ -295,6 +319,89 @@ test('requires an exact readback match', async () => {
   ui.input.change('[New]');
   await ui.button.click();
   assertSaveFailed(plugin, ui, errors);
+  assert.equal(storage.recovery, oldRecovery);
+});
+
+test('leaves data.json untouched when the recovery write fails or cannot be verified', async () => {
+  for (const rejects of [true, false]) {
+    const { plugin, storage, errors } = setup();
+    delete plugin.manifest.dir;
+    const ui = await openSettings(plugin);
+    const adapter = plugin.app.vault.adapter;
+    const write = adapter.write;
+    adapter.write = async (path, content) => {
+      await write(path, content.slice(0, 15));
+      if (rejects) throw new Error('Recovery write failed');
+    };
+    let attempted = false;
+    plugin.saveData = async () => { attempted = true; };
+
+    ui.input.change('[New]');
+    await ui.button.click();
+    assertSaveFailed(plugin, ui, errors);
+    assert.equal(attempted, false);
+    assert.deepEqual(storage.data, { filenameFormat: '[Old]' });
+    assert.equal((await openSettings(setup(storage).plugin)).input.value, '[Old]');
+
+    adapter.write = write;
+    plugin.saveData = Plugin.prototype.saveData;
+    await ui.button.click();
+    assert.deepEqual(storage.data, { filenameFormat: '[New]' });
+    assert.equal(storage.recovery, undefined);
+  }
+});
+
+test('uses the verified recovery after a short data.json write and repairs it on retry', async () => {
+  const { plugin, storage, errors } = setup();
+  const ui = await openSettings(plugin);
+  const truncated = '{"filenameFormat":';
+  plugin.saveData = async () => {
+    assert.equal(storage.recovery, oldRecovery);
+    storage.data = truncated;
+  };
+  ui.input.change('[New]');
+  await ui.button.click();
+  assertSaveFailed(plugin, ui, errors);
+  assert.equal(storage.data, truncated);
+  assert.equal(storage.recovery, oldRecovery);
+  plugin.unload();
+
+  const reopened = setup(storage);
+  const recoveredUi = await openSettings(reopened.plugin);
+  assert.equal(recoveredUi.input.value, '[Old]');
+  reopened.finishLayout();
+  const note = reopened.create('AfterEnable.md');
+  await flushQueue();
+  assert.equal(note.path, 'Old.md');
+
+  let rewroteRecovery = false;
+  reopened.plugin.app.vault.adapter.write = async () => { rewroteRecovery = true; };
+  recoveredUi.input.change('[New]');
+  await recoveredUi.button.click();
+  assert.equal(rewroteRecovery, false);
+  assert.deepEqual(storage.data, { filenameFormat: '[New]' });
+  assert.equal(storage.recovery, undefined);
+  assert.equal(reopened.plugin.filenameFormat, '[New]');
+  assert.equal((await openSettings(setup(storage).plugin)).input.value, '[New]');
+});
+
+test('keeps the recovery authoritative until a verified save clears it', async () => {
+  const { plugin, storage, errors } = setup();
+  const ui = await openSettings(plugin);
+  const adapter = plugin.app.vault.adapter;
+  const remove = adapter.remove;
+  adapter.remove = async () => { throw new Error('Recovery removal failed'); };
+  ui.input.change('[New]');
+  await ui.button.click();
+  assertSaveFailed(plugin, ui, errors);
+  assert.deepEqual(storage.data, { filenameFormat: '[New]' });
+  assert.equal(storage.recovery, oldRecovery);
+  assert.equal((await openSettings(setup(storage).plugin)).input.value, '[Old]');
+
+  adapter.remove = remove;
+  await ui.button.click();
+  assert.equal(storage.recovery, undefined);
+  assert.equal(plugin.filenameFormat, '[New]');
 });
 
 function assertSaveFailed(plugin, ui, errors) {
@@ -409,9 +516,15 @@ test('a save awaiting readback cannot replace the active format of a later enabl
   plugin.loadData = initialRead;
   storage.data = { filenameFormat: '[Reloaded]' };
   await plugin.onload();
+  assert.equal(plugin.filenameFormat, '[Old]');
+  plugin.tab.display();
+  plugin.tab.containerEl.input.change('[Reloaded]');
+  plugin.saveData = Plugin.prototype.saveData;
+  await plugin.tab.containerEl.button.click();
   readback.resolve({ filenameFormat: '[Stale]' });
   await saving;
   assert.equal(plugin.filenameFormat, '[Reloaded]');
+  assert.equal(storage.recovery, undefined);
 });
 
 function deferred() {
@@ -496,8 +609,8 @@ test('suffixes case-insensitive index and disk-only matches', async () => {
 
 test('allows a case-only rename of the source when the disk reports that spelling exists', async () => {
   const { plugin, create, finishLayout } = setup();
-  plugin.app.vault.adapter.exists = async () => true;
   await plugin.onload();
+  plugin.app.vault.adapter.exists = async () => true;
   finishLayout();
   const note = create('Inbox/OLD.md');
   await flushQueue();

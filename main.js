@@ -119,17 +119,8 @@ class AutoDateRenameSettingTab extends PluginSettingTab {
     this.feedback = '';
     this.updatePreview();
     try {
-      const stored = await this.plugin.loadData();
+      await this.plugin.persistFilenameFormat(filenameFormat, this.loadToken);
       if (this.plugin.loadToken !== this.loadToken) return;
-      if (stored?.filenameFormat !== filenameFormat) {
-        await this.plugin.saveData({ filenameFormat });
-        if (this.plugin.loadToken !== this.loadToken) return;
-        const saved = await this.plugin.loadData();
-        if (this.plugin.loadToken !== this.loadToken) return;
-        if (saved?.filenameFormat !== filenameFormat) {
-          throw new Error('The stored file name format did not match the requested format.');
-        }
-      }
       this.plugin.filenameFormat = filenameFormat;
       this.feedback = 'File name format saved.';
     } catch (error) {
@@ -144,6 +135,73 @@ class AutoDateRenameSettingTab extends PluginSettingTab {
 }
 
 module.exports = class AutoDateRenamePlugin extends Plugin {
+  get recoveryPath() {
+    const directory = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+    return normalizePath(`${directory}/data.recovery.json`);
+  }
+
+  async readRecoveryFormat() {
+    const { adapter } = this.app.vault;
+    const path = this.recoveryPath;
+    if (!await adapter.exists(path)) return;
+
+    const raw = await adapter.read(path);
+    try {
+      const format = JSON.parse(raw)?.filenameFormat;
+      if (typeof format === 'string' && format === normalizeFormat(format)) return format;
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+    }
+  }
+
+  async loadFilenameFormat(loadToken) {
+    try {
+      const recovery = await this.readRecoveryFormat();
+      if (recovery !== undefined) return recovery;
+    } catch (error) {
+      if (this.loadToken === loadToken) {
+        console.error('[Auto Date Rename] Could not read the file name format recovery file:', error);
+      }
+    }
+
+    try {
+      return normalizeFormat((await this.loadData())?.filenameFormat);
+    } catch (error) {
+      if (this.loadToken === loadToken) {
+        console.error('[Auto Date Rename] Could not load the file name format:', error);
+      }
+      return DEFAULT_FILENAME_FORMAT;
+    }
+  }
+
+  async persistFilenameFormat(filenameFormat, loadToken) {
+    const { adapter } = this.app.vault;
+    const path = this.recoveryPath;
+    const recovery = await this.readRecoveryFormat();
+    if (this.loadToken !== loadToken) return;
+
+    if (recovery === undefined) {
+      const stored = await this.loadData();
+      if (this.loadToken !== loadToken || stored?.filenameFormat === filenameFormat) return;
+
+      const backup = JSON.stringify({ filenameFormat: this.filenameFormat });
+      await adapter.write(path, backup);
+      if (this.loadToken !== loadToken) return;
+      const verified = await adapter.read(path);
+      if (this.loadToken !== loadToken) return;
+      if (verified !== backup) throw new Error('Could not verify the file name format recovery file.');
+    }
+
+    await this.saveData({ filenameFormat });
+    if (this.loadToken !== loadToken) return;
+    const saved = await this.loadData();
+    if (this.loadToken !== loadToken) return;
+    if (saved?.filenameFormat !== filenameFormat) {
+      throw new Error('The stored file name format did not match the requested format.');
+    }
+    await adapter.remove(path);
+  }
+
   async onload() {
     const loadToken = Symbol();
     this.loadToken = loadToken;
@@ -151,14 +209,7 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
     this.filenameFormat = undefined;
     // Process one event at a time to avoid conflicting filenames.
     let renameQueue = Promise.resolve();
-    const settingsReady = this.loadData()
-      .then((data) => normalizeFormat(data?.filenameFormat))
-      .catch((error) => {
-        if (this.loadToken === loadToken) {
-          console.error('[Auto Date Rename] Could not load the file name format:', error);
-        }
-        return DEFAULT_FILENAME_FORMAT;
-      });
+    const settingsReady = this.loadFilenameFormat(loadToken);
 
     // During vault initialization Obsidian emits "create" for existing files.
     // Registering after the layout is ready prevents accidental mass renaming.
