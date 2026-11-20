@@ -61,6 +61,12 @@ class TFile {
   }
 }
 
+class FileSystemAdapter {
+  getFullPath(path) {
+    return `/vault/${path}`;
+  }
+}
+
 class PluginSettingTab {
   constructor() {
     this.containerEl = {
@@ -110,7 +116,7 @@ class Setting {
   }
 }
 
-function setup(storage = { data: { filenameFormat: '[Old]' } }) {
+function setup(storage = { data: { filenameFormat: '[Old]' } }, { lstat } = {}) {
   const errors = [];
   const warnings = [];
   const timers = new Set();
@@ -125,8 +131,11 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }) {
     },
     clearTimeout(callback) { timers.delete(callback); },
     require(name) {
+      if (name === 'fs' && lstat) return { promises: { lstat } };
       assert.equal(name, 'obsidian');
       return {
+        FileSystemAdapter,
+        Platform: { isDesktopApp: Boolean(lstat) },
         Plugin,
         PluginSettingTab,
         Setting,
@@ -181,7 +190,7 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }) {
     },
     vault: {
       configDir: 'custom-config',
-      adapter: {
+      adapter: Object.assign(lstat ? new FileSystemAdapter() : {}, {
         async exists(path) {
           return path === recoveryPath ? storage.recovery !== undefined : disk.has(path);
         },
@@ -203,7 +212,7 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }) {
           assert.equal(path, recoveryPath);
           delete storage.recovery;
         },
-      },
+      }),
       on(event, callback) {
         listeners[event].add(callback);
         return () => listeners[event].delete(callback);
@@ -623,6 +632,43 @@ test('renames notes in a folder whose listing fails due to an unrelated broken s
   await flushQueue();
   assert.deepEqual([first.path, second.path], ['Inbox/Old.md', 'Inbox/Old-01.md']);
   assert.deepEqual(errors, []);
+});
+
+test('suffixes the name when its desktop destination is a dangling symlink', async () => {
+  const checked = [];
+  const { plugin, create, finishLayout, renamedPaths, errors } = setup(undefined, {
+    async lstat(path) {
+      checked.push(path);
+      if (path !== '/vault/Inbox/Old.md') {
+        throw Object.assign(new Error(`No directory entry at ${path}`), { code: 'ENOENT' });
+      }
+      return { isSymbolicLink: () => true };
+    },
+  });
+  await plugin.onload();
+  finishLayout();
+
+  const note = create('Inbox/Untitled.md');
+  await flushQueue();
+  assert.equal(note.path, 'Inbox/Old-01.md');
+  assert.deepEqual(renamedPaths, ['Inbox/Old-01.md']);
+  assert.deepEqual(checked, ['/vault/Inbox/Old.md', '/vault/Inbox/Old-01.md']);
+  assert.deepEqual(errors, []);
+});
+
+test('skips a desktop rename when the destination entry cannot be checked', async () => {
+  const denied = Object.assign(new Error('Cannot inspect the destination'), { code: 'EACCES' });
+  const { plugin, create, finishLayout, renamedPaths, errors } = setup(undefined, {
+    async lstat() { throw denied; },
+  });
+  await plugin.onload();
+  finishLayout();
+
+  const note = create('Inbox/Untitled.md');
+  await flushQueue();
+  assert.equal(note.path, 'Inbox/Untitled.md');
+  assert.deepEqual(renamedPaths, []);
+  assert.deepEqual(errors, [['[Auto Date Rename] Could not rename note:', denied]]);
 });
 
 test('uses a case-sensitive check to distinguish the source from a case-only destination', async () => {

@@ -1,6 +1,8 @@
 'use strict';
 
-const { Plugin, PluginSettingTab, Setting, TFile, moment, normalizePath } = require('obsidian');
+const {
+  FileSystemAdapter, Platform, Plugin, PluginSettingTab, Setting, TFile, moment, normalizePath
+} = require('obsidian');
 
 const DEFAULT_FILENAME_FORMAT = 'YYYY-MM-DD_HH-mm-ss-SSS';
 const MAX_BASENAME_BYTES = 247; // 255 bytes minus ".md" and "-9999".
@@ -278,6 +280,7 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
 
   async destinationIsOccupied(file, sourcePath, candidate) {
     const { vault } = this.app;
+    const { adapter } = vault;
     const key = pathKey(candidate);
     const indexedCollision = () => {
       const exact = vault.getAbstractFileByPath(candidate);
@@ -286,9 +289,17 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
     };
     if (indexedCollision()) return true;
 
-    if (await vault.adapter.exists(candidate)) {
+    if (await adapter.exists(candidate)) {
       // A case-insensitive filesystem can report the source under the destination spelling.
-      if (key !== pathKey(sourcePath) || await vault.adapter.exists(candidate, true)) return true;
+      if (key !== pathKey(sourcePath) || await adapter.exists(candidate, true)) return true;
+    } else if (Platform.isDesktopApp && adapter instanceof FileSystemAdapter) {
+      // The adapter follows symlinks and can miss a dangling destination entry.
+      try {
+        await require('fs').promises.lstat(adapter.getFullPath(candidate));
+        return true;
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
     }
     return indexedCollision();
   }
