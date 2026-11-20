@@ -51,7 +51,6 @@ class TFile {
   constructor(path) {
     this.path = path;
     this.extension = path.split('.').at(-1);
-    this.parent = { path: path.slice(0, path.lastIndexOf('/') + 1).replace(/\/$/, '') || '/' };
     this.stat = { ctime: creationTime };
   }
 }
@@ -107,10 +106,18 @@ class Setting {
 
 function setup(storage = { data: { filenameFormat: '[Old]' } }) {
   const errors = [];
+  const warnings = [];
+  const timers = new Set();
   const module = {};
   runInNewContext(source, {
     module,
     TextEncoder,
+    setTimeout(callback, delay) {
+      assert.equal(delay, 10_000);
+      timers.add(callback);
+      return callback;
+    },
+    clearTimeout(callback) { timers.delete(callback); },
     require(name) {
       assert.equal(name, 'obsidian');
       return {
@@ -122,14 +129,43 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }) {
         moment: () => ({ format: (format) => format.replace(/\[([^\]]*)\]/g, '$1') }),
       };
     },
-    console: { error: (...args) => errors.push(args) },
+    console: {
+      error: (...args) => errors.push(args),
+      warn: (...args) => warnings.push(args),
+    },
   }, { filename: 'main.js' });
 
   const layoutCallbacks = [];
-  const createListeners = new Set();
+  const listeners = { create: new Set(), rename: new Set(), delete: new Set() };
   const files = new Map();
+  const disk = new Set();
+  const parents = new Map();
   const renamedPaths = [];
   let layoutReady = false;
+  const parentPath = (path) => path.slice(0, Math.max(0, path.lastIndexOf('/'))) || '/';
+  function attach(file, path) {
+    const folder = parentPath(path);
+    if (!parents.has(folder)) parents.set(folder, { path: folder, children: [] });
+    file.parent = parents.get(folder);
+    file.parent.children.push(file);
+    file.path = path;
+    files.set(path, file);
+    disk.add(path);
+  }
+  function detach(file) {
+    files.delete(file.path);
+    disk.delete(file.path);
+    file.parent.children.splice(file.parent.children.indexOf(file), 1);
+  }
+  function move(file, path) {
+    assert.equal(path, normalizePath(path));
+    assert.equal(disk.has(path), false, `Cannot overwrite ${path}`);
+    const oldPath = file.path;
+    detach(file);
+    attach(file, path);
+    renamedPaths.push(path);
+    for (const callback of listeners.rename) callback(file, oldPath);
+  }
   const app = {
     workspace: {
       onLayoutReady(callback) {
@@ -138,10 +174,21 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }) {
       },
     },
     vault: {
+      adapter: {
+        async exists(path) { return disk.has(path); },
+        async list(folder) {
+          return {
+            files: [...disk].filter((path) => parentPath(path) === folder),
+            folders: [],
+          };
+        },
+      },
       on(event, callback) {
-        assert.equal(event, 'create');
-        createListeners.add(callback);
-        return () => createListeners.delete(callback);
+        listeners[event].add(callback);
+        return () => listeners[event].delete(callback);
+      },
+      offref(unsubscribe) {
+        unsubscribe();
       },
       getAbstractFileByPath(path) {
         return files.get(path) ?? null;
@@ -149,26 +196,32 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }) {
     },
     fileManager: {
       async renameFile(file, path) {
-        assert.equal(path, normalizePath(path));
-        assert.equal(files.has(path), false, `Cannot overwrite ${path}`);
-        files.delete(file.path);
-        file.path = path;
-        files.set(path, file);
-        renamedPaths.push(path);
+        move(file, path);
       },
     },
   };
   const plugin = new module.exports(app, storage);
   return {
-    plugin, storage, errors, createListeners, renamedPaths,
+    plugin, storage, errors, warnings, listeners, timers, disk, renamedPaths, move,
+    createListeners: listeners.create,
+    expireRename() {
+      assert.equal(timers.size, 1);
+      const [callback] = timers;
+      timers.delete(callback);
+      callback();
+    },
+    remove(file) {
+      detach(file);
+      for (const callback of listeners.delete) callback(file);
+    },
     finishLayout() {
       layoutReady = true;
       for (const callback of layoutCallbacks.splice(0)) callback();
     },
     create(path) {
       const file = new TFile(path);
-      files.set(path, file);
-      for (const callback of createListeners) callback(file);
+      attach(file, path);
+      for (const callback of listeners.create) callback(file);
       return file;
     },
   };
@@ -363,8 +416,12 @@ test('a save awaiting readback cannot replace the active format of a later enabl
 
 function deferred() {
   let resolve;
-  const promise = new Promise((resolvePromise) => { resolve = resolvePromise; });
-  return { promise, resolve };
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 test('uses the normalized preview name on disk and numbers collisions', async () => {
@@ -384,6 +441,181 @@ test('uses the normalized preview name on disk and numbers collisions', async ()
   ]);
   assert.equal(renamedPaths.length, 3);
   assert.deepEqual(errors, []);
+});
+
+test('the burst waits for a visible move and continues while link updates are pending', async () => {
+  const { plugin, create, move, finishLayout, listeners, timers, errors } = setup();
+  const calls = [];
+  const links = deferred();
+  const lastRename = deferred();
+  plugin.app.fileManager.renameFile = (file, path) => {
+    calls.push([file, path]);
+    if (calls.length === 1) return Promise.resolve();
+    move(file, path);
+    return calls.length === 2 ? links.promise : lastRename.promise;
+  };
+  await plugin.onload();
+  const other = create('Other.md');
+  finishLayout();
+  const first = create('First.md');
+  const second = create('Second.md');
+  const third = create('Third.md');
+  await flushQueue();
+  assert.deepEqual(calls, [[first, 'Old.md']]);
+  move(other, 'Unrelated.md');
+  await flushQueue();
+  assert.equal(calls.length, 1);
+
+  move(first, 'Old.md');
+  await flushQueue();
+  assert.deepEqual([first.path, second.path, third.path], ['Old.md', 'Old-01.md', 'Old-02.md']);
+  assert.equal(timers.size, 0);
+  assert.equal(listeners.rename.size, 0);
+  assert.equal(listeners.delete.size, 0);
+  links.resolve();
+  lastRename.reject(new Error('late link update failure'));
+  await flushQueue();
+  assert.deepEqual(errors, []);
+});
+
+test('suffixes case-insensitive index and disk-only matches', async () => {
+  const { plugin, create, disk, finishLayout } = setup();
+  await plugin.onload();
+  const existing = create('Inbox/OLD.md');
+  disk.add('Inbox/OLD-01.md');
+  const adapter = plugin.app.vault.adapter;
+  const exists = adapter.exists;
+  adapter.exists = (path) => path === 'Inbox/Old-02.md' || exists(path);
+  finishLayout();
+  const note = create('Inbox/Untitled.md');
+  await flushQueue();
+  assert.equal(note.path, 'Inbox/Old-03.md');
+  assert.equal(existing.path, 'Inbox/OLD.md');
+  assert.ok(disk.has('Inbox/OLD-01.md'));
+});
+
+test('allows a case-only rename of the source when the disk reports that spelling exists', async () => {
+  const { plugin, create, finishLayout } = setup();
+  plugin.app.vault.adapter.exists = async () => true;
+  await plugin.onload();
+  finishLayout();
+  const note = create('Inbox/OLD.md');
+  await flushQueue();
+  assert.equal(note.path, 'Inbox/Old.md');
+});
+
+test('retries when a rejected rename encounters a newly occupied destination', async () => {
+  const { plugin, create, disk, finishLayout, move, errors } = setup();
+  const calls = [];
+  plugin.app.fileManager.renameFile = async (file, path) => {
+    calls.push(path);
+    if (calls.length === 1) {
+      disk.add('OLD.md');
+      throw new Error('Destination file already exists');
+    }
+    move(file, path);
+  };
+  await plugin.onload();
+  finishLayout();
+  const note = create('Untitled.md');
+  await flushQueue();
+  assert.deepEqual(calls, ['Old.md', 'Old-01.md']);
+  assert.equal(note.path, 'Old-01.md');
+  assert.deepEqual(errors, []);
+});
+
+test('a timeout advances the queue and reserves the destination until the source moves or is deleted', async () => {
+  for (const change of ['move', 'delete']) {
+    const { plugin, create, move, remove, expireRename, finishLayout, listeners, timers, warnings } = setup();
+    const delayed = deferred();
+    plugin.app.fileManager.renameFile = (file, path) => {
+      if (file.path === 'Delayed.md') return delayed.promise;
+      move(file, path);
+      return Promise.resolve();
+    };
+    await plugin.onload();
+    finishLayout();
+    const first = create('Delayed.md');
+    const second = create('Second.md');
+    await flushQueue();
+    assert.equal(second.path, 'Second.md');
+    expireRename();
+    await flushQueue();
+    assert.equal(second.path, 'Old-01.md');
+    assert.equal(warnings.length, 1);
+    assert.equal(listeners.rename.size, 1);
+    assert.equal(listeners.delete.size, 1);
+
+    delayed.reject(new Error('late rename rejection'));
+    await flushQueue();
+    if (change === 'move') move(first, 'Moved.md');
+    else remove(first);
+    const third = create('Third.md');
+    await flushQueue();
+    assert.equal(third.path, 'Old.md');
+    assert.equal(timers.size, 0);
+    assert.equal(listeners.rename.size, 0);
+    assert.equal(listeners.delete.size, 0);
+  }
+});
+
+test('unload releases pending and timed-out renames and discards the queued notes', async () => {
+  const { plugin, create, finishLayout, expireRename, listeners, timers, warnings } = setup();
+  const delayed = deferred();
+  const calls = [];
+  plugin.app.fileManager.renameFile = (file) => {
+    calls.push(file.path);
+    return delayed.promise;
+  };
+  await plugin.onload();
+  finishLayout();
+  create('First.md');
+  create('Second.md');
+  create('Third.md');
+  await flushQueue();
+  expireRename();
+  await flushQueue();
+  assert.equal(listeners.rename.size, 2);
+  assert.equal(timers.size, 1);
+
+  plugin.unload();
+  delayed.reject(new Error('late rejection after unload'));
+  await flushQueue();
+  assert.deepEqual(calls, ['First.md', 'Second.md']);
+  assert.equal(warnings.length, 1);
+  assert.equal(timers.size, 0);
+  assert.ok(Object.values(listeners).every((registered) => registered.size === 0));
+});
+
+test('skips a source moved during the disk check and discards checks from an earlier enable', async () => {
+  const { plugin, create, move, finishLayout, renamedPaths } = setup();
+  const adapter = plugin.app.vault.adapter;
+  const exists = adapter.exists;
+  await plugin.onload();
+  finishLayout();
+
+  const firstCheck = deferred();
+  adapter.exists = () => firstCheck.promise;
+  const first = create('First.md');
+  await flushQueue();
+  move(first, 'Moved.md');
+  firstCheck.resolve(false);
+  await flushQueue();
+  assert.equal(first.path, 'Moved.md');
+
+  const secondCheck = deferred();
+  adapter.exists = () => secondCheck.promise;
+  const second = create('Second.md');
+  await flushQueue();
+  plugin.unload();
+  adapter.exists = exists;
+  await plugin.onload();
+  const third = create('Third.md');
+  secondCheck.resolve(false);
+  await flushQueue();
+  assert.equal(second.path, 'Second.md');
+  assert.equal(third.path, 'Old.md');
+  assert.deepEqual(renamedPaths, ['Moved.md', 'Old.md']);
 });
 
 test('skips renaming a note that already has the normalized name', async () => {

@@ -4,6 +4,7 @@ const { Plugin, PluginSettingTab, Setting, TFile, moment, normalizePath } = requ
 
 const DEFAULT_FILENAME_FORMAT = 'YYYY-MM-DD_HH-mm-ss-SSS';
 const MAX_BASENAME_BYTES = 247; // 255 bytes minus ".md" and "-9999".
+const RENAME_TIMEOUT_MS = 10_000;
 const utf8 = new TextEncoder();
 
 function pad(number, width = 2) {
@@ -54,6 +55,10 @@ function getFilenameError(name) {
     return `Shorten the format to keep the base filename within ${MAX_BASENAME_BYTES} UTF-8 bytes.`;
   }
   return '';
+}
+
+function pathKey(path) {
+  return normalizePath(path).toLowerCase();
 }
 
 class AutoDateRenameSettingTab extends PluginSettingTab {
@@ -142,6 +147,7 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
   async onload() {
     const loadToken = Symbol();
     this.loadToken = loadToken;
+    this.renameReservations = new Map();
     this.filenameFormat = undefined;
     // Process one event at a time to avoid conflicting filenames.
     let renameQueue = Promise.resolve();
@@ -166,7 +172,7 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
           if (this.loadToken !== loadToken) return;
           const format = filenameFormat ?? await settingsReady;
           if (this.loadToken !== loadToken) return;
-          await this.renameNewNote(file, format);
+          await this.renameNewNote(file, format, loadToken);
         }).catch((error) => console.error('[Auto Date Rename] Could not rename note:', error));
       }));
     });
@@ -179,11 +185,15 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
 
   onunload() {
     this.loadToken = undefined;
+    for (const release of this.renameReservations.values()) release();
   }
 
-  async renameNewNote(file, filenameFormat = this.filenameFormat) {
-    // Skip notes already removed before the queued handler runs.
-    if (this.app.vault.getAbstractFileByPath(file.path) !== file) return;
+  async renameNewNote(file, filenameFormat, loadToken) {
+    const { vault } = this.app;
+    const sourcePath = file.path;
+    const sourceIsCurrent = () => this.loadToken === loadToken &&
+      file.path === sourcePath && vault.getAbstractFileByPath(sourcePath) === file;
+    if (!sourceIsCurrent()) return;
 
     const folder = file.parent && file.parent.path !== '/' ? file.parent.path : '';
     const { ctime } = file.stat;
@@ -195,11 +205,90 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
     for (let index = 0; index < 10000; index++) {
       const suffix = index === 0 ? '' : `-${pad(index, 2)}`;
       const candidate = normalizePath(`${folder ? folder + '/' : ''}${baseName}${suffix}.md`);
-      if (candidate === file.path) return;
-      if (this.app.vault.getAbstractFileByPath(candidate) !== null) continue;
-      await this.app.fileManager.renameFile(file, candidate);
-      return;
+      if (candidate === sourcePath) return;
+      if (this.renameReservations.has(pathKey(candidate))) continue;
+
+      const occupied = await this.destinationIsOccupied(file, sourcePath, candidate, folder);
+      if (!sourceIsCurrent()) return;
+      if (occupied) continue;
+
+      try {
+        await this.waitForRename(file, sourcePath, candidate);
+        return;
+      } catch (error) {
+        if (!sourceIsCurrent()) return;
+        const collided = await this.destinationIsOccupied(file, sourcePath, candidate, folder);
+        if (!sourceIsCurrent()) return;
+        if (!collided) throw error;
+      }
     }
     console.warn('[Auto Date Rename] Could not find an unused filename for:', file.path);
+  }
+
+  async destinationIsOccupied(file, sourcePath, candidate, folder) {
+    const { vault } = this.app;
+    const key = pathKey(candidate);
+    const indexedCollision = () => {
+      const exact = vault.getAbstractFileByPath(candidate);
+      return (exact && exact !== file) ||
+        file.parent?.children.some((entry) => entry !== file && pathKey(entry.path) === key);
+    };
+    if (indexedCollision()) return true;
+
+    const exists = await vault.adapter.exists(candidate);
+    if (exists && key !== pathKey(sourcePath)) return true;
+
+    // Check disk entries that the vault has yet to index, including on case-sensitive disks.
+    const { files, folders } = await vault.adapter.list(folder || '/');
+    const entries = files.concat(folders).map(normalizePath);
+    const source = normalizePath(sourcePath);
+    return indexedCollision() || entries.some((path) => path !== source && pathKey(path) === key) ||
+      (exists && !entries.includes(source));
+  }
+
+  waitForRename(file, sourcePath, candidate) {
+    const { vault, fileManager } = this.app;
+    const reservations = this.renameReservations;
+    const key = pathKey(candidate);
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timeout);
+        vault.offref(renameRef);
+        vault.offref(deleteRef);
+        reservations.delete(key);
+      };
+      const release = () => {
+        cleanup();
+        resolve();
+      };
+      const renameRef = vault.on('rename', (renamed) => {
+        if (renamed === file && file.path !== sourcePath) release();
+      });
+      const deleteRef = vault.on('delete', (deleted) => {
+        if (deleted === file) release();
+      });
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        console.warn('[Auto Date Rename] Could not confirm rename within 10 seconds:', sourcePath, candidate);
+        // Keep the destination reserved until the source moves, is deleted, or the plugin unloads.
+        resolve();
+      }, RENAME_TIMEOUT_MS);
+      reservations.set(key, release);
+
+      const onError = (error) => {
+        if (timedOut || reservations.get(key) !== release) return;
+        cleanup();
+        reject(error);
+      };
+      try {
+        Promise.resolve(fileManager.renameFile(file, candidate)).then(() => {
+          if (reservations.get(key) === release && file.path === candidate &&
+              vault.getAbstractFileByPath(candidate) === file) release();
+        }, onError);
+      } catch (error) {
+        onError(error);
+      }
+    });
   }
 };
