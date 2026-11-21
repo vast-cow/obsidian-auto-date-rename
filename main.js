@@ -7,8 +7,8 @@ const {
 const DEFAULT_FILENAME_FORMAT = 'YYYY-MM-DD_HH-mm-ss-SSS';
 const DEFAULT_SETTINGS = {
   filenameFormat: DEFAULT_FILENAME_FORMAT,
-  maxCreationAgeMs: 5000,
-  maxFutureSkewMs: 2000,
+  maxCreationAgeMs: 1000,
+  maxFutureSkewMs: 0,
 };
 const TOLERANCE_FIELDS = [
   {
@@ -151,7 +151,7 @@ class AutoDateRenameSettingTab extends PluginSettingTab {
       new Setting(containerEl)
         .setName(label)
         .setDesc(`${description} Use up to three decimal places. ` +
-          `Clear the field to restore the default of ${defaultSeconds} seconds.`)
+          `Clear the field and save to restore the default (${defaultSeconds} s).`)
         .addText(addInput(key, label, defaultSeconds));
       inputs[key].inputEl.setAttribute('inputmode', 'decimal');
     }

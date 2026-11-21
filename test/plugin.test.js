@@ -16,7 +16,7 @@ const recoveryPath = `${pluginDir}/data.recovery.json`;
 const filenameLabel = 'File name format';
 const ageLabel = 'Maximum creation age (seconds)';
 const skewLabel = 'Maximum future skew (seconds)';
-const settings = (filenameFormat, maxCreationAgeMs = 5000, maxFutureSkewMs = 2000) =>
+const settings = (filenameFormat, maxCreationAgeMs = 1000, maxFutureSkewMs = 0) =>
   ({ filenameFormat, maxCreationAgeMs, maxFutureSkewMs });
 const oldRecovery = JSON.stringify(settings('[Old]'));
 
@@ -333,12 +333,20 @@ test('zero allows only an exact timestamp and clearing either field restores its
   await flushQueue();
   assert.deepEqual([exact.path, past.path, future.path], ['Old.md', 'Past.md', 'Future.md']);
 
+  skew.change('2');
+  await ui.button.click();
+  assert.deepEqual(storage.data, settings('[Old]', 0, 2000));
+
   age.change('');
   await ui.button.click();
-  assert.deepEqual(storage.data, settings('[Old]', 5000, 0));
+  assert.deepEqual(storage.data, settings('[Old]', 1000, 2000));
   skew.change('  ');
   await ui.button.click();
   assert.deepEqual(storage.data, settings('[Old]'));
+
+  const reset = await openSettings(setup(storage).plugin);
+  assert.equal(reset.inputs[ageLabel].value, '1');
+  assert.equal(reset.inputs[skewLabel].value, '0');
 });
 
 test('invalid tolerance inputs identify each field and block the shared save', async () => {
@@ -377,17 +385,18 @@ test('loads missing tolerances independently from old settings and recovery file
   const legacySettings = { filenameFormat: '[Legacy]' };
   const { plugin, storage } = setup({ data: legacySettings });
   const ui = await openSettings(plugin);
-  assert.equal(ui.inputs[ageLabel].value, '5');
-  assert.equal(ui.inputs[ageLabel].placeholder, '5');
-  assert.equal(ui.inputs[skewLabel].value, '2');
-  assert.equal(ui.inputs[skewLabel].placeholder, '2');
+  assert.equal(ui.inputs[ageLabel].value, '1');
+  assert.equal(ui.inputs[ageLabel].placeholder, '1');
+  assert.equal(ui.inputs[skewLabel].value, '0');
+  assert.equal(ui.inputs[skewLabel].placeholder, '0');
   await ui.button.click();
   assert.deepEqual(storage.data, settings('[Legacy]'));
 
   for (const { source, expected } of [
     { source: legacySettings, expected: settings('[Legacy]') },
     { source: { ...legacySettings, maxCreationAgeMs: 0 }, expected: settings('[Legacy]', 0) },
-    { source: { ...legacySettings, maxFutureSkewMs: 125 }, expected: settings('[Legacy]', 5000, 125) },
+    { source: { ...legacySettings, maxFutureSkewMs: 125 }, expected: settings('[Legacy]', 1000, 125) },
+    { source: settings('[Legacy]', 5000, 2000), expected: settings('[Legacy]', 5000, 2000) },
     { source: { ...legacySettings, maxCreationAgeMs: '0', maxFutureSkewMs: -1 },
       expected: settings('[Legacy]') },
   ]) {
@@ -704,7 +713,7 @@ test('a save awaiting readback cannot replace settings of a later enable', async
   await plugin.tab.containerEl.button.click();
   readback.resolve(settings('[Stale]', 0));
   await saving;
-  assert.deepEqual({ ...plugin.settings }, settings('[Reloaded]', 5000, 250));
+  assert.deepEqual({ ...plugin.settings }, settings('[Reloaded]', 1000, 250));
   assert.equal(storage.recovery, undefined);
 });
 
@@ -723,7 +732,7 @@ test('renames a recent note using its creation time and skips an older synced no
   await plugin.onload();
   finishLayout();
 
-  const synced = create('Inbox/Synced.md', { ctime: creationTime - 5001 });
+  const synced = create('Inbox/Synced.md', { ctime: creationTime - 1001 });
   const local = create('Inbox/Untitled.md', { ctime: creationTime - 1000 });
   await flushQueue();
 
@@ -740,7 +749,7 @@ test('skips missing, invalid, and excessively future creation times', async () =
   const invalidStats = [
     null, {}, { ctime: null }, { ctime: NaN }, { ctime: Infinity },
     { ctime: String(creationTime) },
-    { ctime: creationTime + 2001 },
+    { ctime: creationTime + 1 },
   ];
   const paths = invalidStats.map((_, index) => `Inbox/Note ${index}.md`);
   const notes = invalidStats.map((stat, index) => create(paths[index], stat));
@@ -764,13 +773,13 @@ test('skips non-positive creation times even within the age window', async () =>
   assert.deepEqual(renamedPaths, []);
 });
 
-test('accepts both endpoints of the creation-time window and suffixes collisions', async () => {
+test('accepts both endpoints of the default creation-time window and suffixes collisions', async () => {
   const { plugin, create, finishLayout, renamedPaths } = setup();
   await plugin.onload();
   finishLayout();
 
-  create('Oldest eligible.md', { ctime: creationTime - 5000 });
-  create('Furthest eligible future.md', { ctime: creationTime + 2000 });
+  create('Oldest eligible.md', { ctime: creationTime - 1000 });
+  create('Exact timestamp.md');
   await flushQueue();
 
   assert.deepEqual(renamedPaths, ['Old.md', 'Old-01.md']);

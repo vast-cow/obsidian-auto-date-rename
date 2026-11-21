@@ -43,10 +43,10 @@ To restore the default `YYYY-MM-DD_HH-mm-ss-SSS`, clear the field and click **Sa
 
 ## Creation time tolerance
 
-- **Maximum creation age (seconds)** sets how far before the create event the recorded creation time can be. The default is **5 seconds**.
-- **Maximum future skew (seconds)** sets how far after the create event the recorded creation time can be. The default is **2 seconds**.
+- **Maximum creation age (seconds)** sets how far before the create event the recorded creation time can be. The default is **1 second**.
+- **Maximum future skew (seconds)** sets how far after the create event the recorded creation time can be. The default is **0 seconds**.
 
-Enter a non-negative number of seconds with up to three decimal places, such as `0.125` for 125 milliseconds. Enter `0` to allow no difference in that direction. Clear either field and click **Save** to restore its default.
+Enter a non-negative number of seconds with up to three decimal places, such as `0.125` for 125 milliseconds. Enter `0` to allow no difference in that direction. The default applies when a setting is missing. Valid saved values are kept. Clear either field and click **Save** to restore its default.
 
 ## Notes
 
