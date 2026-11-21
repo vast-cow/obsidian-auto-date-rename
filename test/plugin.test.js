@@ -54,10 +54,10 @@ class Plugin {
 }
 
 class TFile {
-  constructor(path) {
+  constructor(path, stat) {
     this.path = path;
     this.extension = path.split('.').at(-1);
-    this.stat = { ctime: creationTime };
+    this.stat = stat;
   }
 }
 
@@ -121,9 +121,13 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }, { lstat } = {}) 
   const warnings = [];
   const timers = new Set();
   const module = {};
+  let now = creationTime;
   runInNewContext(source, {
     module,
     TextEncoder,
+    Date: class extends Date {
+      static now() { return now; }
+    },
     setTimeout(callback, delay) {
       assert.equal(delay, 10_000);
       timers.add(callback);
@@ -234,6 +238,9 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }, { lstat } = {}) 
   return {
     plugin, storage, errors, warnings, listeners, timers, disk, renamedPaths, move,
     createListeners: listeners.create,
+    advanceTime(milliseconds) {
+      now += milliseconds;
+    },
     expireRename() {
       assert.equal(timers.size, 1);
       const [callback] = timers;
@@ -248,8 +255,8 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }, { lstat } = {}) 
       layoutReady = true;
       for (const callback of layoutCallbacks.splice(0)) callback();
     },
-    create(path) {
-      const file = new TFile(path);
+    create(path, stat = { ctime: creationTime }) {
+      const file = new TFile(path, stat);
       attach(file, path);
       for (const callback of listeners.create) callback(file);
       return file;
@@ -546,6 +553,51 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+test('renames a recent note using its creation time and skips an older synced note', async () => {
+  const { plugin, create, finishLayout, renamedPaths } = setup({});
+  await plugin.onload();
+  finishLayout();
+
+  const synced = create('Inbox/Synced.md', { ctime: creationTime - 5001 });
+  const local = create('Inbox/Untitled.md', { ctime: creationTime - 1000 });
+  await flushQueue();
+
+  assert.equal(synced.path, 'Inbox/Synced.md');
+  assert.equal(local.path, 'Inbox/2026-11-20_12-01-29-123.md');
+  assert.deepEqual(renamedPaths, [local.path]);
+});
+
+test('skips missing, invalid, non-positive, and excessively future creation times', async () => {
+  const { plugin, create, finishLayout, renamedPaths, errors } = setup();
+  await plugin.onload();
+  finishLayout();
+
+  const invalidStats = [
+    null, {}, { ctime: null }, { ctime: NaN }, { ctime: Infinity },
+    { ctime: String(creationTime) }, { ctime: 0 }, { ctime: -1 },
+    { ctime: creationTime + 2001 },
+  ];
+  const paths = invalidStats.map((_, index) => `Inbox/Note ${index}.md`);
+  const notes = invalidStats.map((stat, index) => create(paths[index], stat));
+  await flushQueue();
+
+  assert.deepEqual(notes.map((file) => file.path), paths);
+  assert.deepEqual(renamedPaths, []);
+  assert.deepEqual(errors, []);
+});
+
+test('accepts both endpoints of the creation-time window and suffixes collisions', async () => {
+  const { plugin, create, finishLayout, renamedPaths } = setup();
+  await plugin.onload();
+  finishLayout();
+
+  create('Oldest eligible.md', { ctime: creationTime - 5000 });
+  create('Furthest eligible future.md', { ctime: creationTime + 2000 });
+  await flushQueue();
+
+  assert.deepEqual(renamedPaths, ['Old.md', 'Old-01.md']);
+});
+
 test('uses the normalized preview name on disk and numbers collisions', async () => {
   const { plugin, create, finishLayout, renamedPaths, errors } = setup();
   const ui = await openSettings(plugin);
@@ -565,8 +617,8 @@ test('uses the normalized preview name on disk and numbers collisions', async ()
   assert.deepEqual(errors, []);
 });
 
-test('the burst waits for a visible move and continues while link updates are pending', async () => {
-  const { plugin, create, move, finishLayout, listeners, timers, errors } = setup();
+test('eligible notes stay queued past the age limit and continue while link updates are pending', async () => {
+  const { plugin, create, move, finishLayout, advanceTime, listeners, timers, errors } = setup();
   const calls = [];
   const links = deferred();
   const lastRename = deferred();
@@ -584,6 +636,7 @@ test('the burst waits for a visible move and continues while link updates are pe
   const third = create('Third.md');
   await flushQueue();
   assert.deepEqual(calls, [[first, 'Old.md']]);
+  advanceTime(6000);
   move(other, 'Unrelated.md');
   await flushQueue();
   assert.equal(calls.length, 1);

@@ -6,6 +6,8 @@ const {
 
 const DEFAULT_FILENAME_FORMAT = 'YYYY-MM-DD_HH-mm-ss-SSS';
 const MAX_BASENAME_BYTES = 247; // 255 bytes minus ".md" and "-9999".
+const MAX_CREATION_AGE_MS = 5000;
+const MAX_FUTURE_SKEW_MS = 2000;
 const RENAME_TIMEOUT_MS = 10_000;
 const utf8 = new TextEncoder();
 
@@ -220,12 +222,19 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
       this.registerEvent(this.app.vault.on('create', (file) => {
         if (this.loadToken !== loadToken) return;
         if (!(file instanceof TFile) || file.extension !== 'md') return;
+
+        // Check the creation time at event delivery, before any queue delay.
+        const ctime = file.stat?.ctime;
+        if (!Number.isFinite(ctime) || ctime <= 0) return;
+        const age = Date.now() - ctime;
+        if (age < -MAX_FUTURE_SKEW_MS || age > MAX_CREATION_AGE_MS) return;
+
         const filenameFormat = this.filenameFormat;
         renameQueue = renameQueue.then(async () => {
           if (this.loadToken !== loadToken) return;
           const format = filenameFormat ?? await settingsReady;
           if (this.loadToken !== loadToken) return;
-          await this.renameNewNote(file, format, loadToken);
+          await this.renameNewNote(file, format, loadToken, ctime);
         }).catch((error) => console.error('[Auto Date Rename] Could not rename note:', error));
       }));
     });
@@ -241,7 +250,7 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
     for (const release of this.renameReservations.values()) release();
   }
 
-  async renameNewNote(file, filenameFormat, loadToken) {
+  async renameNewNote(file, filenameFormat, loadToken, ctime) {
     const { vault } = this.app;
     const sourcePath = file.path;
     const sourceIsCurrent = () => this.loadToken === loadToken &&
@@ -249,8 +258,7 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
     if (!sourceIsCurrent()) return;
 
     const folder = file.parent && file.parent.path !== '/' ? file.parent.path : '';
-    const { ctime } = file.stat;
-    const date = new Date(Number.isFinite(ctime) && ctime > 0 ? ctime : Date.now());
+    const date = new Date(ctime);
     const { name, error } = getFormattedFilename(date, filenameFormat);
     const baseName = error ? formatLocalDateTime(date) : name;
 
