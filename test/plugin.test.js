@@ -238,8 +238,8 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }, { lstat } = {}) 
   return {
     plugin, storage, errors, warnings, listeners, timers, disk, renamedPaths, move,
     createListeners: listeners.create,
-    advanceTime(milliseconds) {
-      now += milliseconds;
+    setTime(timestamp) {
+      now = timestamp;
     },
     expireRename() {
       assert.equal(timers.size, 1);
@@ -567,14 +567,14 @@ test('renames a recent note using its creation time and skips an older synced no
   assert.deepEqual(renamedPaths, [local.path]);
 });
 
-test('skips missing, invalid, non-positive, and excessively future creation times', async () => {
+test('skips missing, invalid, and excessively future creation times', async () => {
   const { plugin, create, finishLayout, renamedPaths, errors } = setup();
   await plugin.onload();
   finishLayout();
 
   const invalidStats = [
     null, {}, { ctime: null }, { ctime: NaN }, { ctime: Infinity },
-    { ctime: String(creationTime) }, { ctime: 0 }, { ctime: -1 },
+    { ctime: String(creationTime) },
     { ctime: creationTime + 2001 },
   ];
   const paths = invalidStats.map((_, index) => `Inbox/Note ${index}.md`);
@@ -584,6 +584,19 @@ test('skips missing, invalid, non-positive, and excessively future creation time
   assert.deepEqual(notes.map((file) => file.path), paths);
   assert.deepEqual(renamedPaths, []);
   assert.deepEqual(errors, []);
+});
+
+test('skips non-positive creation times even within the age window', async () => {
+  const { plugin, create, finishLayout, setTime, renamedPaths } = setup();
+  await plugin.onload();
+  finishLayout();
+  setTime(1);
+
+  create('Zero.md', { ctime: 0 });
+  create('Negative.md', { ctime: -1 });
+  await flushQueue();
+
+  assert.deepEqual(renamedPaths, []);
 });
 
 test('accepts both endpoints of the creation-time window and suffixes collisions', async () => {
@@ -618,7 +631,7 @@ test('uses the normalized preview name on disk and numbers collisions', async ()
 });
 
 test('eligible notes stay queued past the age limit and continue while link updates are pending', async () => {
-  const { plugin, create, move, finishLayout, advanceTime, listeners, timers, errors } = setup();
+  const { plugin, create, move, finishLayout, setTime, listeners, timers, errors } = setup();
   const calls = [];
   const links = deferred();
   const lastRename = deferred();
@@ -636,7 +649,7 @@ test('eligible notes stay queued past the age limit and continue while link upda
   const third = create('Third.md');
   await flushQueue();
   assert.deepEqual(calls, [[first, 'Old.md']]);
-  advanceTime(6000);
+  setTime(creationTime + 6000);
   move(other, 'Unrelated.md');
   await flushQueue();
   assert.equal(calls.length, 1);
