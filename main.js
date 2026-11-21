@@ -5,9 +5,24 @@ const {
 } = require('obsidian');
 
 const DEFAULT_FILENAME_FORMAT = 'YYYY-MM-DD_HH-mm-ss-SSS';
+const DEFAULT_SETTINGS = {
+  filenameFormat: DEFAULT_FILENAME_FORMAT,
+  maxCreationAgeMs: 5000,
+  maxFutureSkewMs: 2000,
+};
+const TOLERANCE_FIELDS = [
+  {
+    key: 'maxCreationAgeMs',
+    label: 'Maximum creation age (seconds)',
+    description: 'How far before the create event the creation time can be.',
+  },
+  {
+    key: 'maxFutureSkewMs',
+    label: 'Maximum future skew (seconds)',
+    description: 'How far after the create event the creation time can be.',
+  },
+];
 const MAX_BASENAME_BYTES = 247; // 255 bytes minus ".md" and "-9999".
-const MAX_CREATION_AGE_MS = 5000;
-const MAX_FUTURE_SKEW_MS = 2000;
 const RENAME_TIMEOUT_MS = 10_000;
 const utf8 = new TextEncoder();
 
@@ -29,6 +44,38 @@ function formatLocalDateTime(date) {
 
 function normalizeFormat(format) {
   return (typeof format === 'string' && format.trim()) || DEFAULT_FILENAME_FORMAT;
+}
+
+function isValidTolerance(milliseconds) {
+  return Number.isSafeInteger(milliseconds) && milliseconds >= 0;
+}
+
+function normalizeSettings(data) {
+  const settings = { ...DEFAULT_SETTINGS, filenameFormat: normalizeFormat(data?.filenameFormat) };
+  for (const { key } of TOLERANCE_FIELDS) {
+    if (isValidTolerance(data?.[key])) settings[key] = data[key];
+  }
+  return settings;
+}
+
+function settingsMatch(stored, requested) {
+  return Object.keys(DEFAULT_SETTINGS).every((key) => stored?.[key] === requested[key]);
+}
+
+function formatSeconds(milliseconds) {
+  const digits = String(milliseconds).padStart(4, '0');
+  const seconds = digits.slice(0, -3);
+  const fraction = digits.slice(-3).replace(/0+$/, '');
+  return fraction ? `${seconds}.${fraction}` : seconds;
+}
+
+function parseSeconds(value, defaultMilliseconds) {
+  const trimmed = value.trim();
+  if (!trimmed) return defaultMilliseconds;
+  if (!/^\d*(?:\.\d{1,3})?$/.test(trimmed)) return NaN;
+  // Build the integer milliseconds as digits to avoid floating-point rounding.
+  const [seconds, fraction = ''] = trimmed.split('.');
+  return Number(seconds + fraction.padEnd(3, '0'));
 }
 
 function getFormattedFilename(date, format) {
@@ -70,7 +117,10 @@ class AutoDateRenameSettingTab extends PluginSettingTab {
     super(plugin.app, plugin);
     this.plugin = plugin;
     this.loadToken = loadToken;
-    this.draft = plugin.filenameFormat;
+    this.draft = { filenameFormat: plugin.settings.filenameFormat };
+    for (const { key } of TOLERANCE_FIELDS) {
+      this.draft[key] = formatSeconds(plugin.settings[key]);
+    }
     this.feedback = '';
     this.saving = false;
   }
@@ -79,61 +129,86 @@ class AutoDateRenameSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    let input;
+    const inputs = {};
     let saveButton;
+    const addInput = (key, label, placeholder) => (text) => {
+      inputs[key] = text.setPlaceholder(placeholder).setValue(this.draft[key]);
+      text.inputEl.setAttribute('aria-label', label);
+      text.onChange((value) => {
+        this.draft[key] = value;
+        this.feedback = '';
+        this.updateDisplay();
+      });
+    };
+
     new Setting(containerEl)
       .setName('File name format')
       .setDesc('Use Moment.js format tokens. Clear the field and save to restore the default.')
-      .addText((text) => {
-        input = text.setPlaceholder(DEFAULT_FILENAME_FORMAT).setValue(this.draft);
-        input.inputEl.setAttribute('aria-label', 'File name format');
-        input.onChange((value) => {
-          this.draft = value;
-          this.feedback = '';
-          this.updatePreview();
-        });
-      })
+      .addText(addInput('filenameFormat', 'File name format', DEFAULT_FILENAME_FORMAT));
+    const preview = containerEl.createDiv();
+    for (const { key, label, description } of TOLERANCE_FIELDS) {
+      const defaultSeconds = formatSeconds(DEFAULT_SETTINGS[key]);
+      new Setting(containerEl)
+        .setName(label)
+        .setDesc(`${description} Use up to three decimal places. ` +
+          `Clear the field to restore the default of ${defaultSeconds} seconds.`)
+        .addText(addInput(key, label, defaultSeconds));
+      inputs[key].inputEl.setAttribute('inputmode', 'decimal');
+    }
+    new Setting(containerEl)
       .addButton((button) => {
         saveButton = button.setButtonText('Save').setCta().onClick(() => this.save());
       });
 
-    const preview = containerEl.createDiv();
     const status = containerEl.createDiv({ attr: { role: 'status' } });
-    this.updatePreview = () => {
-      const { name, error } = getFormattedFilename(new Date(), normalizeFormat(this.draft));
+    this.updateDisplay = () => {
+      const settings = { filenameFormat: normalizeFormat(this.draft.filenameFormat) };
+      const { name, error } = getFormattedFilename(new Date(), settings.filenameFormat);
+      const errors = { filenameFormat: error && `File name format — ${error}` };
+      for (const { key, label } of TOLERANCE_FIELDS) {
+        const milliseconds = parseSeconds(this.draft[key], DEFAULT_SETTINGS[key]);
+        settings[key] = milliseconds;
+        if (Number.isNaN(milliseconds)) {
+          errors[key] = `${label} must be a non-negative number with up to three decimal places.`;
+        } else if (!isValidTolerance(milliseconds)) {
+          errors[key] = `${label} cannot exceed ${formatSeconds(Number.MAX_SAFE_INTEGER)} seconds.`;
+        }
+      }
+
+      const message = Object.values(errors).filter(Boolean).join(' ');
       preview.textContent = `Preview: ${name}.md`;
-      status.textContent = error || this.feedback;
-      input.inputEl.setAttribute('aria-invalid', String(Boolean(error)));
-      input.setDisabled(this.saving);
-      saveButton.setDisabled(this.saving || Boolean(error));
+      status.textContent = message || this.feedback;
+      for (const [key, input] of Object.entries(inputs)) {
+        input.inputEl.setAttribute('aria-invalid', String(Boolean(errors[key])));
+        input.setDisabled(this.saving);
+      }
+      saveButton.setDisabled(this.saving || Boolean(message));
+      return message ? undefined : settings;
     };
-    this.updatePreview();
+    this.updateDisplay();
   }
 
   async save() {
     if (this.saving || this.plugin.loadToken !== this.loadToken) return;
 
-    const filenameFormat = normalizeFormat(this.draft);
-    if (getFormattedFilename(new Date(), filenameFormat).error) {
-      this.updatePreview();
-      return;
-    }
+    const settings = this.updateDisplay();
+    if (!settings) return;
 
     this.saving = true;
     this.feedback = '';
-    this.updatePreview();
+    this.updateDisplay();
     try {
-      await this.plugin.persistFilenameFormat(filenameFormat, this.loadToken);
+      await this.plugin.persistSettings(settings, this.loadToken);
       if (this.plugin.loadToken !== this.loadToken) return;
-      this.plugin.filenameFormat = filenameFormat;
-      this.feedback = 'File name format saved.';
+      this.plugin.settings = settings;
+      this.feedback = 'Settings saved.';
     } catch (error) {
       if (this.plugin.loadToken !== this.loadToken) return;
-      this.feedback = 'Could not save the file name format. The previous format is still active.';
-      console.error('[Auto Date Rename] Could not save the file name format:', error);
+      this.feedback = 'Could not save the settings. The previous settings are still active.';
+      console.error('[Auto Date Rename] Could not save the settings:', error);
     } finally {
       this.saving = false;
-      if (this.plugin.loadToken === this.loadToken) this.updatePreview();
+      if (this.plugin.loadToken === this.loadToken) this.updateDisplay();
     }
   }
 }
@@ -144,64 +219,67 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
     return normalizePath(`${directory}/data.recovery.json`);
   }
 
-  async readRecoveryFormat() {
+  async readRecoverySettings() {
     const { adapter } = this.app.vault;
     const path = this.recoveryPath;
     if (!await adapter.exists(path)) return;
 
     const raw = await adapter.read(path);
     try {
-      const format = JSON.parse(raw)?.filenameFormat;
-      if (typeof format === 'string' && format === normalizeFormat(format)) return format;
+      const data = JSON.parse(raw);
+      const format = data?.filenameFormat;
+      if (typeof format === 'string' && format === normalizeFormat(format)) {
+        return normalizeSettings(data);
+      }
     } catch (error) {
       if (!(error instanceof SyntaxError)) throw error;
     }
   }
 
-  async loadFilenameFormat(loadToken) {
+  async loadSettings(loadToken) {
     try {
-      const recovery = await this.readRecoveryFormat();
-      if (recovery !== undefined) return recovery;
+      const recovery = await this.readRecoverySettings();
+      if (recovery) return recovery;
     } catch (error) {
       if (this.loadToken === loadToken) {
-        console.error('[Auto Date Rename] Could not read the file name format recovery file:', error);
+        console.error('[Auto Date Rename] Could not read the settings recovery file:', error);
       }
     }
 
     try {
-      return normalizeFormat((await this.loadData())?.filenameFormat);
+      return normalizeSettings(await this.loadData());
     } catch (error) {
       if (this.loadToken === loadToken) {
-        console.error('[Auto Date Rename] Could not load the file name format:', error);
+        console.error('[Auto Date Rename] Could not load the settings:', error);
       }
-      return DEFAULT_FILENAME_FORMAT;
+      return { ...DEFAULT_SETTINGS };
     }
   }
 
-  async persistFilenameFormat(filenameFormat, loadToken) {
+  async persistSettings(settings, loadToken) {
     const { adapter } = this.app.vault;
     const path = this.recoveryPath;
-    const recovery = await this.readRecoveryFormat();
+    const recovery = await this.readRecoverySettings();
     if (this.loadToken !== loadToken) return;
 
-    if (recovery === undefined) {
+    if (!recovery) {
       const stored = await this.loadData();
-      if (this.loadToken !== loadToken || stored?.filenameFormat === filenameFormat) return;
+      if (this.loadToken !== loadToken || settingsMatch(stored, settings)) return;
 
-      const backup = JSON.stringify({ filenameFormat: this.filenameFormat });
+      const backup = JSON.stringify(this.settings);
       await adapter.write(path, backup);
       if (this.loadToken !== loadToken) return;
       const verified = await adapter.read(path);
       if (this.loadToken !== loadToken) return;
-      if (verified !== backup) throw new Error('Could not verify the file name format recovery file.');
+      if (verified !== backup) throw new Error('Could not verify the settings recovery file.');
     }
 
-    await this.saveData({ filenameFormat });
+    await this.saveData(settings);
     if (this.loadToken !== loadToken) return;
     const saved = await this.loadData();
     if (this.loadToken !== loadToken) return;
-    if (saved?.filenameFormat !== filenameFormat) {
-      throw new Error('The stored file name format did not match the requested format.');
+    if (!settingsMatch(saved, settings)) {
+      throw new Error('The stored settings did not match the requested settings.');
     }
     await adapter.remove(path);
   }
@@ -210,10 +288,18 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
     const loadToken = Symbol();
     this.loadToken = loadToken;
     this.renameReservations = new Map();
-    this.filenameFormat = undefined;
+    this.settings = undefined;
     // Process one event at a time to avoid conflicting filenames.
     let renameQueue = Promise.resolve();
-    const settingsReady = this.loadFilenameFormat(loadToken);
+    const pendingCreates = [];
+    const queueRename = ({ file, ctime, age }, { filenameFormat, maxCreationAgeMs, maxFutureSkewMs }) => {
+      if (!(-maxFutureSkewMs <= age && age <= maxCreationAgeMs)) return;
+      renameQueue = renameQueue.then(async () => {
+        if (this.loadToken !== loadToken) return;
+        await this.renameNewNote(file, filenameFormat, loadToken, ctime);
+      }).catch((error) => console.error('[Auto Date Rename] Could not rename note:', error));
+    };
+    const settingsReady = this.loadSettings(loadToken);
 
     // During vault initialization Obsidian emits "create" for existing files.
     // Registering after the layout is ready prevents accidental mass renaming.
@@ -223,25 +309,21 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
         if (this.loadToken !== loadToken) return;
         if (!(file instanceof TFile) || file.extension !== 'md') return;
 
-        // Check the creation time at event delivery, before any queue delay.
+        // Capture the age at event delivery, even if settings are still loading.
         const ctime = file.stat?.ctime;
         if (!Number.isFinite(ctime) || ctime <= 0) return;
         const age = Date.now() - ctime;
-        if (age < -MAX_FUTURE_SKEW_MS || age > MAX_CREATION_AGE_MS) return;
-
-        const filenameFormat = this.filenameFormat;
-        renameQueue = renameQueue.then(async () => {
-          if (this.loadToken !== loadToken) return;
-          const format = filenameFormat ?? await settingsReady;
-          if (this.loadToken !== loadToken) return;
-          await this.renameNewNote(file, format, loadToken, ctime);
-        }).catch((error) => console.error('[Auto Date Rename] Could not rename note:', error));
+        const event = { file, ctime, age };
+        if (this.settings) queueRename(event, this.settings);
+        else pendingCreates.push(event);
       }));
     });
 
-    const filenameFormat = await settingsReady;
+    const settings = await settingsReady;
     if (this.loadToken !== loadToken) return;
-    this.filenameFormat = filenameFormat;
+    this.settings = settings;
+    for (const event of pendingCreates) queueRename(event, settings);
+    pendingCreates.length = 0;
     this.addSettingTab(new AutoDateRenameSettingTab(this, loadToken));
   }
 

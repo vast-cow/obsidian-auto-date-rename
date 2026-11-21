@@ -27,12 +27,12 @@ Folder structure:
 - Preserves the original folder structure.
 - If a file with the same name already exists, it appends a suffix like `-01`, `-02`, etc.
 - Renames files using Obsidian's `fileManager.renameFile()` (internal link updates depend on Obsidian's settings and behavior).
-- Checks the file's creation timestamp (`ctime`) when Obsidian delivers the create event, before queuing the rename. The timestamp must be a finite, positive number and fall between **5 seconds before** and **2 seconds after** the event is received, inclusive.
+- Checks the file's creation timestamp (`ctime`) against the configured tolerance range when Obsidian delivers the create event, before queuing the rename. The timestamp must be a finite, positive number. Both ends of the range are inclusive. If settings are still loading, the plugin checks events in the order it received them, using the age recorded when each event arrived.
 - Uses that timestamp to generate the filename in the local time of the device running Obsidian. If the note already has the generated name, it is left as is.
 
 ## File name format
 
-Open **Settings → Auto Date Rename**, enter a Moment.js format in **File name format**, and check the `.md` preview. Click **Save** to apply the format to new Markdown notes. See the [Moment.js format tokens](https://momentjs.com/docs/#/displaying/format/).
+Open **Settings → Auto Date Rename**, enter a Moment.js format in **File name format**, and check the `.md` preview. Click **Save** to apply the format and both creation time tolerances together to new Markdown notes. See the [Moment.js format tokens](https://momentjs.com/docs/#/displaying/format/).
 
 - `YYYY-MM-DD` produces `2026-11-20.md`.
 - `YYYYMMDD_HHmm` produces `20261120_1201.md`.
@@ -41,8 +41,15 @@ The normalized base filename can be up to **247 UTF-8 bytes**, leaving room for 
 
 To restore the default `YYYY-MM-DD_HH-mm-ss-SSS`, clear the field and click **Save**.
 
+## Creation time tolerance
+
+- **Maximum creation age (seconds)** sets how far before the create event the recorded creation time can be. The default is **5 seconds**.
+- **Maximum future skew (seconds)** sets how far after the create event the recorded creation time can be. The default is **2 seconds**.
+
+Enter a non-negative number of seconds with up to three decimal places, such as `0.125` for 125 milliseconds. Enter `0` to allow no difference in that direction. Clear either field and click **Save** to restore its default.
+
 ## Notes
 
-The timestamp check helps skip older notes from Self-hosted LiveSync or other sync tools that preserve the original creation time. It is a best-effort filter. A synced note can still be renamed if it arrives within the five-second window or if the sync tool assigns it a fresh timestamp. A local note can be skipped if its create event arrives more than five seconds after its recorded creation time.
+The timestamp check helps skip older notes from Self-hosted LiveSync or other sync tools that preserve the original creation time. It is a best-effort filter. A synced note can still be renamed if its timestamp falls within the configured range, including when the sync tool assigns it a fresh timestamp. A local note can be skipped if its timestamp is older than the maximum creation age or farther ahead than the maximum future skew when its create event arrives.
 
 Please test the plugin in a test vault first. There is no function to rename existing notes in bulk. The behavior regarding new file events and conflicts with other plugins may vary depending on your environment.

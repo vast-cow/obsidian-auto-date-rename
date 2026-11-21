@@ -13,7 +13,12 @@ const defaultFilename = '2026-11-20_12-01-30-123.md';
 const pluginId = 'obsidian-auto-date-rename';
 const pluginDir = `custom-config/plugins/${pluginId}`;
 const recoveryPath = `${pluginDir}/data.recovery.json`;
-const oldRecovery = JSON.stringify({ filenameFormat: '[Old]' });
+const filenameLabel = 'File name format';
+const ageLabel = 'Maximum creation age (seconds)';
+const skewLabel = 'Maximum future skew (seconds)';
+const settings = (filenameFormat, maxCreationAgeMs = 5000, maxFutureSkewMs = 2000) =>
+  ({ filenameFormat, maxCreationAgeMs, maxFutureSkewMs });
+const oldRecovery = JSON.stringify(settings('[Old]'));
 
 function normalizePath(path) {
   const normalized = path.replace(/[\\/]+/g, '/').replace(/^\/|\/$/g, '');
@@ -72,6 +77,7 @@ class PluginSettingTab {
     this.containerEl = {
       empty() {
         this.children = [];
+        this.inputs = {};
       },
       createDiv() {
         const div = { textContent: '' };
@@ -87,19 +93,21 @@ class Setting {
     this.container = container;
   }
 
-  setName() { return this; }
+  setName(name) { this.name = name; return this; }
   setDesc() { return this; }
 
   addText(build) {
+    const attributes = {};
     const input = {
-      inputEl: { setAttribute() {} },
-      setPlaceholder() { return this; },
+      attributes,
+      inputEl: { setAttribute(name, value) { attributes[name] = value; } },
+      setPlaceholder(placeholder) { this.placeholder = placeholder; return this; },
       setValue(value) { this.value = value; return this; },
       onChange(change) { this.change = change; return this; },
       setDisabled(disabled) { this.disabled = disabled; },
     };
     build(input);
-    this.container.input = input;
+    this.container.inputs[this.name] = input;
     return this;
   }
 
@@ -270,30 +278,141 @@ async function openSettings(plugin) {
   return plugin.tab.containerEl;
 }
 
-test('applies a confirmed save and loads it on the next enable', async () => {
-  const { plugin, storage } = setup();
+test('saves the format and exact milliseconds and applies them immediately and after restart', async () => {
+  const { plugin, storage, create, finishLayout } = setup();
   const ui = await openSettings(plugin);
-  ui.input.change('[New]');
+  ui.inputs[filenameLabel].change('[New]');
+  ui.inputs[ageLabel].change('0.125');
+  ui.inputs[skewLabel].change('1.001');
+  assert.equal(ui.children[0].textContent, 'Preview: New.md');
   await ui.button.click();
 
-  assert.deepEqual(storage.data, { filenameFormat: '[New]' });
+  assert.deepEqual(storage.data, settings('[New]', 125, 1001));
   assert.equal(storage.recovery, undefined);
-  assert.equal(plugin.filenameFormat, '[New]');
-  assert.equal(ui.children[1].textContent, 'File name format saved.');
-  const reopened = await openSettings(setup(storage).plugin);
-  assert.equal(reopened.input.value, '[New]');
+  assert.equal(ui.children[1].textContent, 'Settings saved.');
+  finishLayout();
+  const oldest = create('Oldest.md', { ctime: creationTime - 125 });
+  const tooOld = create('Too old.md', { ctime: creationTime - 126 });
+  const furthest = create('Furthest.md', { ctime: creationTime + 1001 });
+  const tooFar = create('Too far.md', { ctime: creationTime + 1002 });
+  await flushQueue();
+  assert.deepEqual([oldest.path, tooOld.path, furthest.path, tooFar.path], [
+    'New.md', 'Too old.md', 'New-01.md', 'Too far.md',
+  ]);
+
+  plugin.unload();
+  const reopened = setup(storage);
+  const reopenedUi = await openSettings(reopened.plugin);
+  assert.equal(reopenedUi.inputs[filenameLabel].value, '[New]');
+  assert.equal(reopenedUi.inputs[ageLabel].value, '0.125');
+  assert.equal(reopenedUi.inputs[skewLabel].value, '1.001');
+  reopened.finishLayout();
+  const eligible = reopened.create('Eligible.md', { ctime: creationTime + 1001 });
+  const ineligible = reopened.create('Ineligible.md', { ctime: creationTime + 1002 });
+  await flushQueue();
+  assert.deepEqual([eligible.path, ineligible.path], ['New.md', 'Ineligible.md']);
 });
 
-test('skips the write when the exact requested format is already stored', async () => {
+test('zero allows only an exact timestamp and clearing either field restores its own default', async () => {
+  const { plugin, storage, create, finishLayout } = setup();
+  const ui = await openSettings(plugin);
+  const age = ui.inputs[ageLabel];
+  const skew = ui.inputs[skewLabel];
+  age.change('0');
+  skew.change('0.000');
+  await ui.button.click();
+  assert.deepEqual(storage.data, settings('[Old]', 0, 0));
+
+  const reopened = await openSettings(setup(storage).plugin);
+  assert.equal(reopened.inputs[ageLabel].value, '0');
+  assert.equal(reopened.inputs[skewLabel].value, '0');
+  finishLayout();
+  const exact = create('Exact.md');
+  const past = create('Past.md', { ctime: creationTime - 1 });
+  const future = create('Future.md', { ctime: creationTime + 1 });
+  await flushQueue();
+  assert.deepEqual([exact.path, past.path, future.path], ['Old.md', 'Past.md', 'Future.md']);
+
+  age.change('');
+  await ui.button.click();
+  assert.deepEqual(storage.data, settings('[Old]', 5000, 0));
+  skew.change('  ');
+  await ui.button.click();
+  assert.deepEqual(storage.data, settings('[Old]'));
+});
+
+test('invalid tolerance inputs identify each field and block the shared save', async () => {
   const { plugin, storage } = setup();
   const ui = await openSettings(plugin);
-  storage.data = { filenameFormat: '[New]' };
+  const age = ui.inputs[ageLabel];
+  const skew = ui.inputs[skewLabel];
+  ui.inputs[filenameLabel].change('[New]');
+  for (const invalid of ['-1', '0.0001', '1e3', 'Infinity', '5s', '.', '9007199254740.992']) {
+    age.change(invalid);
+    assert.equal(age.attributes['aria-invalid'], 'true');
+    assert.equal(skew.attributes['aria-invalid'], 'false');
+    assert.ok(ui.children[1].textContent.includes(ageLabel));
+    assert.equal(ui.button.disabled, true);
+    await ui.button.click();
+    assert.deepEqual(storage.data, { filenameFormat: '[Old]' });
+    assert.equal(storage.recovery, undefined);
+  }
+
+  skew.change('-0.1');
+  assert.ok(ui.children[1].textContent.includes(ageLabel));
+  assert.ok(ui.children[1].textContent.includes(skewLabel));
+  age.change('9007199254740.991');
+  assert.equal(age.attributes['aria-invalid'], 'false');
+  assert.equal(skew.attributes['aria-invalid'], 'true');
+  assert.equal(ui.button.disabled, true);
+  skew.change('.125');
+  assert.equal(ui.button.disabled, false);
+  await ui.button.click();
+  assert.deepEqual(storage.data, settings('[New]', Number.MAX_SAFE_INTEGER, 125));
+  const reopened = await openSettings(setup(storage).plugin);
+  assert.equal(reopened.inputs[ageLabel].value, '9007199254740.991');
+});
+
+test('loads missing tolerances independently from old settings and recovery files', async () => {
+  const legacySettings = { filenameFormat: '[Legacy]' };
+  const { plugin, storage } = setup({ data: legacySettings });
+  const ui = await openSettings(plugin);
+  assert.equal(ui.inputs[ageLabel].value, '5');
+  assert.equal(ui.inputs[ageLabel].placeholder, '5');
+  assert.equal(ui.inputs[skewLabel].value, '2');
+  assert.equal(ui.inputs[skewLabel].placeholder, '2');
+  await ui.button.click();
+  assert.deepEqual(storage.data, settings('[Legacy]'));
+
+  for (const { source, expected } of [
+    { source: legacySettings, expected: settings('[Legacy]') },
+    { source: { ...legacySettings, maxCreationAgeMs: 0 }, expected: settings('[Legacy]', 0) },
+    { source: { ...legacySettings, maxFutureSkewMs: 125 }, expected: settings('[Legacy]', 5000, 125) },
+    { source: { ...legacySettings, maxCreationAgeMs: '0', maxFutureSkewMs: -1 },
+      expected: settings('[Legacy]') },
+  ]) {
+    const fromData = setup({ data: source }).plugin;
+    await fromData.onload();
+    assert.deepEqual({ ...fromData.settings }, expected);
+    const fromRecovery = setup({
+      data: settings('[Unconfirmed]', 6000, 4000),
+      recovery: JSON.stringify(source),
+    }).plugin;
+    await fromRecovery.onload();
+    assert.deepEqual({ ...fromRecovery.settings }, expected);
+  }
+});
+
+test('skips the write when all requested settings are already stored', async () => {
+  const { plugin, storage } = setup();
+  const ui = await openSettings(plugin);
+  storage.data = settings('[New]');
   plugin.saveData = () => assert.fail('unexpected write');
 
-  ui.input.change('[New]');
+  ui.inputs[filenameLabel].change('[New]');
   await ui.button.click();
-  assert.equal(plugin.filenameFormat, '[New]');
-  assert.equal(ui.children[1].textContent, 'File name format saved.');
+  assert.equal(plugin.settings.filenameFormat, '[New]');
+  assert.equal(ui.children[1].textContent, 'Settings saved.');
 });
 
 test('retains the active format and allows retry after a rejected write', async () => {
@@ -301,7 +420,7 @@ test('retains the active format and allows retry after a rejected write', async 
   const ui = await openSettings(plugin);
   plugin.saveData = async () => { throw new Error('write failed'); };
 
-  ui.input.change('[New]');
+  ui.inputs[filenameLabel].change('[New]');
   await ui.button.click();
   assertSaveFailed(plugin, ui, errors);
   assert.deepEqual(storage.data, { filenameFormat: '[Old]' });
@@ -309,9 +428,9 @@ test('retains the active format and allows retry after a rejected write', async 
 
   plugin.saveData = Plugin.prototype.saveData;
   await ui.button.click();
-  assert.equal(plugin.filenameFormat, '[New]');
+  assert.equal(plugin.settings.filenameFormat, '[New]');
   assert.equal(storage.recovery, undefined);
-  assert.equal(ui.children[1].textContent, 'File name format saved.');
+  assert.equal(ui.children[1].textContent, 'Settings saved.');
 });
 
 test('retains the active format when a resolved write does not persist', async () => {
@@ -319,23 +438,29 @@ test('retains the active format when a resolved write does not persist', async (
   const ui = await openSettings(plugin);
   plugin.saveData = async () => {};
 
-  ui.input.change('[New]');
+  ui.inputs[filenameLabel].change('[New]');
   await ui.button.click();
   assertSaveFailed(plugin, ui, errors);
   assert.deepEqual(storage.data, { filenameFormat: '[Old]' });
 });
 
-test('requires an exact readback match', async () => {
-  const { plugin, storage, errors } = setup();
-  const ui = await openSettings(plugin);
-  plugin.saveData = async ({ filenameFormat }) => {
-    storage.data = { filenameFormat: filenameFormat + ' ' };
-  };
+test('requires an exact readback match for all three settings', async () => {
+  for (const mismatch of [
+    { filenameFormat: '[New] ' }, { maxCreationAgeMs: '125' }, { maxFutureSkewMs: undefined },
+  ]) {
+    const { plugin, storage, errors } = setup();
+    const ui = await openSettings(plugin);
+    plugin.saveData = async (requested) => {
+      storage.data = { ...requested, ...mismatch };
+    };
 
-  ui.input.change('[New]');
-  await ui.button.click();
-  assertSaveFailed(plugin, ui, errors);
-  assert.equal(storage.recovery, oldRecovery);
+    ui.inputs[filenameLabel].change('[New]');
+    ui.inputs[ageLabel].change('0.125');
+    ui.inputs[skewLabel].change('0');
+    await ui.button.click();
+    assertSaveFailed(plugin, ui, errors);
+    assert.equal(storage.recovery, oldRecovery);
+  }
 });
 
 test('leaves data.json untouched when the recovery write fails or cannot be verified', async () => {
@@ -352,17 +477,17 @@ test('leaves data.json untouched when the recovery write fails or cannot be veri
     let attempted = false;
     plugin.saveData = async () => { attempted = true; };
 
-    ui.input.change('[New]');
+    ui.inputs[filenameLabel].change('[New]');
     await ui.button.click();
     assertSaveFailed(plugin, ui, errors);
     assert.equal(attempted, false);
     assert.deepEqual(storage.data, { filenameFormat: '[Old]' });
-    assert.equal((await openSettings(setup(storage).plugin)).input.value, '[Old]');
+    assert.equal((await openSettings(setup(storage).plugin)).inputs[filenameLabel].value, '[Old]');
 
     adapter.write = write;
     plugin.saveData = Plugin.prototype.saveData;
     await ui.button.click();
-    assert.deepEqual(storage.data, { filenameFormat: '[New]' });
+    assert.deepEqual(storage.data, settings('[New]'));
     assert.equal(storage.recovery, undefined);
   }
 });
@@ -375,7 +500,7 @@ test('uses the verified recovery after a short data.json write and repairs it on
     assert.equal(storage.recovery, oldRecovery);
     storage.data = truncated;
   };
-  ui.input.change('[New]');
+  ui.inputs[filenameLabel].change('[New]');
   await ui.button.click();
   assertSaveFailed(plugin, ui, errors);
   assert.equal(storage.data, truncated);
@@ -384,7 +509,7 @@ test('uses the verified recovery after a short data.json write and repairs it on
 
   const reopened = setup(storage);
   const recoveredUi = await openSettings(reopened.plugin);
-  assert.equal(recoveredUi.input.value, '[Old]');
+  assert.equal(recoveredUi.inputs[filenameLabel].value, '[Old]');
   reopened.finishLayout();
   const note = reopened.create('AfterEnable.md');
   await flushQueue();
@@ -392,60 +517,93 @@ test('uses the verified recovery after a short data.json write and repairs it on
 
   let rewroteRecovery = false;
   reopened.plugin.app.vault.adapter.write = async () => { rewroteRecovery = true; };
-  recoveredUi.input.change('[New]');
+  recoveredUi.inputs[filenameLabel].change('[New]');
   await recoveredUi.button.click();
   assert.equal(rewroteRecovery, false);
-  assert.deepEqual(storage.data, { filenameFormat: '[New]' });
+  assert.deepEqual(storage.data, settings('[New]'));
   assert.equal(storage.recovery, undefined);
-  assert.equal(reopened.plugin.filenameFormat, '[New]');
-  assert.equal((await openSettings(setup(storage).plugin)).input.value, '[New]');
+  assert.equal(reopened.plugin.settings.filenameFormat, '[New]');
+  assert.equal((await openSettings(setup(storage).plugin)).inputs[filenameLabel].value, '[New]');
 });
 
-test('keeps the recovery authoritative until a verified save clears it', async () => {
-  const { plugin, storage, errors } = setup();
+test('keeps confirmed settings active until a verified save clears the recovery file', async () => {
+  const confirmed = settings('[Old]', 125, 750);
+  const requested = settings('[New]', 900, 0);
+  const { plugin, storage, errors, create, finishLayout } = setup({ data: confirmed });
   const ui = await openSettings(plugin);
+  finishLayout();
   const adapter = plugin.app.vault.adapter;
   const remove = adapter.remove;
-  adapter.remove = async () => { throw new Error('Recovery removal failed'); };
-  ui.input.change('[New]');
-  await ui.button.click();
-  assertSaveFailed(plugin, ui, errors);
-  assert.deepEqual(storage.data, { filenameFormat: '[New]' });
-  assert.equal(storage.recovery, oldRecovery);
-  assert.equal((await openSettings(setup(storage).plugin)).input.value, '[Old]');
+  const removing = deferred();
+  adapter.remove = () => removing.promise;
+  ui.inputs[filenameLabel].change('[New]');
+  ui.inputs[ageLabel].change('0.9');
+  ui.inputs[skewLabel].change('0');
+  const saving = ui.button.click();
+  await flushQueue();
+
+  assert.equal(ui.button.disabled, true);
+  assert.deepEqual(storage.data, requested);
+  assert.equal(storage.recovery, JSON.stringify(confirmed));
+  const duringSave = create('During save.md', { ctime: creationTime + 750 });
+  await flushQueue();
+  assert.equal(duringSave.path, 'Old.md');
+  removing.reject(new Error('Recovery removal failed'));
+  await saving;
+  assertSaveFailed(plugin, ui, errors, confirmed);
+  const afterFailure = create('After failure.md', { ctime: creationTime - 126 });
+  await flushQueue();
+  assert.equal(afterFailure.path, 'After failure.md');
+
+  const reopened = setup(storage);
+  await reopened.plugin.onload();
+  assert.deepEqual({ ...reopened.plugin.settings }, confirmed);
 
   adapter.remove = remove;
   await ui.button.click();
   assert.equal(storage.recovery, undefined);
-  assert.equal(plugin.filenameFormat, '[New]');
+  assert.deepEqual({ ...plugin.settings }, requested);
+  const afterRetry = create('After retry.md', { ctime: creationTime - 900 });
+  const future = create('Future.md', { ctime: creationTime + 1 });
+  await flushQueue();
+  assert.deepEqual([afterRetry.path, future.path], ['New.md', 'Future.md']);
 });
 
-function assertSaveFailed(plugin, ui, errors) {
-  assert.equal(plugin.filenameFormat, '[Old]');
-  assert.match(ui.children[1].textContent, /Could not save the file name format/);
-  assert.equal(ui.input.disabled, false);
+function assertSaveFailed(plugin, ui, errors, confirmed = settings('[Old]')) {
+  assert.deepEqual({ ...plugin.settings }, confirmed);
+  assert.match(ui.children[1].textContent, /Could not save the settings/);
+  assert.ok(Object.values(ui.inputs).every((input) => !input.disabled));
   assert.equal(ui.button.disabled, false);
   assert.equal(errors.length, 1);
 }
 
-test('notes created after layout readiness wait for the loaded format', async () => {
-  const { plugin, create, finishLayout } = setup();
+test('startup checks the received ages in order against the loaded settings', async () => {
+  const { plugin, create, finishLayout, setTime } = setup();
   const loading = deferred();
   plugin.loadData = () => loading.promise;
   const renames = [];
-  plugin.renameNewNote = (file, format) => renames.push([file.path, format]);
+  plugin.renameNewNote = (file, format, _loadToken, ctime) => renames.push([file.path, format, ctime]);
   const startup = plugin.onload();
 
   create('Existing.md');
   finishLayout();
-  create('Early.md');
+  create('Too old.md', { ctime: creationTime - 6001 });
+  const first = create('Oldest.md', { ctime: creationTime - 6000 });
+  setTime(creationTime + 100);
+  create('Too far.md', { ctime: creationTime + 3101 });
+  create('Furthest.md', { ctime: creationTime + 3100 });
+  first.stat.ctime = creationTime;
   await flushQueue();
   assert.deepEqual(renames, []);
 
-  loading.resolve({ filenameFormat: '[Loaded]' });
+  setTime(creationTime + 30_000);
+  loading.resolve(settings('[Loaded]', 6000, 3000));
   await startup;
   await flushQueue();
-  assert.deepEqual(renames, [['Early.md', '[Loaded]']]);
+  assert.deepEqual(renames, [
+    ['Oldest.md', '[Loaded]', creationTime - 6000],
+    ['Furthest.md', '[Loaded]', creationTime + 3100],
+  ]);
 });
 
 test('disabling during load invalidates the layout callback and settings registration', async () => {
@@ -480,8 +638,8 @@ test('disabling while a note waits for settings discards that rename', async () 
   assert.deepEqual(renames, []);
 });
 
-test('queued notes use the active format at creation and are discarded on disable', async () => {
-  const { plugin, create, finishLayout } = setup();
+test('queued notes use the settings at reception and are discarded on disable', async () => {
+  const { plugin, create, finishLayout, setTime } = setup({ data: settings('[Old]', 125, 0) });
   const ui = await openSettings(plugin);
   finishLayout();
   const firstRename = deferred();
@@ -494,21 +652,26 @@ test('queued notes use the active format at creation and are discarded on disabl
   };
 
   create('First.md');
-  create('Second.md');
+  create('Second.md', { ctime: creationTime - 125 });
+  create('Ineligible.md', { ctime: creationTime + 1 });
   await flushQueue();
   assert.deepEqual(renames, [['First.md', '[Old]']]);
 
-  ui.input.change('[New]');
+  ui.inputs[filenameLabel].change('[New]');
+  ui.inputs[ageLabel].change('0');
+  ui.inputs[skewLabel].change('0.125');
   await ui.button.click();
-  create('Discarded.md');
+  setTime(creationTime + 10_000);
+  create('Now too old.md', { ctime: creationTime + 9999 });
+  create('Discarded.md', { ctime: creationTime + 10_125 });
   firstRename.resolve();
   await flushQueue();
   assert.deepEqual(renames, [['First.md', '[Old]'], ['Second.md', '[Old]']]);
 
   plugin.unload();
   const reopened = await openSettings(plugin);
-  assert.equal(reopened.input.value, '[New]');
-  create('AfterEnable.md');
+  assert.equal(reopened.inputs[filenameLabel].value, '[New]');
+  create('AfterEnable.md', { ctime: creationTime + 10_125 });
   secondRename.resolve();
   await flushQueue();
   assert.deepEqual(renames, [
@@ -516,7 +679,7 @@ test('queued notes use the active format at creation and are discarded on disabl
   ]);
 });
 
-test('a save awaiting readback cannot replace the active format of a later enable', async () => {
+test('a save awaiting readback cannot replace settings of a later enable', async () => {
   const { plugin, storage } = setup();
   const ui = await openSettings(plugin);
   const readback = deferred();
@@ -525,21 +688,23 @@ test('a save awaiting readback cannot replace the active format of a later enabl
     plugin.loadData = () => readback.promise;
   };
 
-  ui.input.change('[Stale]');
+  ui.inputs[filenameLabel].change('[Stale]');
+  ui.inputs[ageLabel].change('0');
   const saving = ui.button.click();
   await flushQueue();
   plugin.unload();
   plugin.loadData = initialRead;
   storage.data = { filenameFormat: '[Reloaded]' };
   await plugin.onload();
-  assert.equal(plugin.filenameFormat, '[Old]');
+  assert.deepEqual({ ...plugin.settings }, settings('[Old]'));
   plugin.tab.display();
-  plugin.tab.containerEl.input.change('[Reloaded]');
+  plugin.tab.containerEl.inputs[filenameLabel].change('[Reloaded]');
+  plugin.tab.containerEl.inputs[skewLabel].change('0.25');
   plugin.saveData = Plugin.prototype.saveData;
   await plugin.tab.containerEl.button.click();
-  readback.resolve({ filenameFormat: '[Stale]' });
+  readback.resolve(settings('[Stale]', 0));
   await saving;
-  assert.equal(plugin.filenameFormat, '[Reloaded]');
+  assert.deepEqual({ ...plugin.settings }, settings('[Reloaded]', 5000, 250));
   assert.equal(storage.recovery, undefined);
 });
 
@@ -614,7 +779,7 @@ test('accepts both endpoints of the creation-time window and suffixes collisions
 test('uses the normalized preview name on disk and numbers collisions', async () => {
   const { plugin, create, finishLayout, renamedPaths, errors } = setup();
   const ui = await openSettings(plugin);
-  ui.input.change('[New\u00a0Note]');
+  ui.inputs[filenameLabel].change('[New\u00a0Note]');
   assert.equal(ui.children[0].textContent, 'Preview: New Note.md');
   await ui.button.click();
 
@@ -920,7 +1085,7 @@ test('rejects raw separators that normalizePath would remove', async () => {
   const { plugin, create, finishLayout } = setup(storage);
   const ui = await openSettings(plugin);
   for (const draft of ['[New/]', '[New\\]']) {
-    ui.input.change(draft);
+    ui.inputs[filenameLabel].change(draft);
     assert.equal(ui.button.disabled, true);
     assert.match(ui.children[1].textContent, /unsafe/);
   }
@@ -937,7 +1102,7 @@ test('accepts 247 normalized UTF-8 bytes with room for the longest suffix', asyn
   const raw = 'e\u0301'.repeat(123) + 'x';
   const base = 'é'.repeat(123) + 'x';
   assert.equal(Buffer.byteLength(base), 247);
-  ui.input.change(`[${raw}]`);
+  ui.inputs[filenameLabel].change(`[${raw}]`);
   assert.equal(ui.children[0].textContent, `Preview: ${base}.md`);
   assert.equal(ui.button.disabled, false);
   await ui.button.click();
@@ -958,7 +1123,7 @@ test('blocks a 248-byte draft and falls back when that format is already stored'
   const oversized = `[${'é'.repeat(124)}]`;
   const storage = { data: { filenameFormat: '[Old]' } };
   const ui = await openSettings(setup(storage).plugin);
-  ui.input.change(oversized);
+  ui.inputs[filenameLabel].change(oversized);
   assert.equal(ui.button.disabled, true);
   assert.match(ui.children[1].textContent, /Shorten the format.*247 UTF-8 bytes/);
   await ui.button.click();
