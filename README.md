@@ -1,6 +1,6 @@
 # Auto Date Rename (Obsidian Local Plugin)
 
-This plugin automatically renames eligible new Markdown notes in Obsidian using their creation date and time.
+This plugin automatically renames new Markdown notes in Obsidian when their title exactly matches the configured target. It uses the note's creation date and time for the new name.
 
 Example: `2026-11-20_12-01-30-123.md`
 
@@ -23,16 +23,16 @@ Folder structure:
 
 ## Features
 
-- Only applies to `.md` files created **after** the plugin is enabled (existing notes are not modified).
+- Listens for new `.md` files after Obsidian's workspace is ready. Existing notes are left as they are at startup.
 - Preserves the original folder structure.
 - If a file with the same name already exists, it appends a suffix like `-01`, `-02`, etc.
 - Renames files using Obsidian's `fileManager.renameFile()` (internal link updates depend on Obsidian's settings and behavior).
-- Checks the file's creation timestamp (`ctime`) against the configured tolerance range when Obsidian delivers the create event, before queuing the rename. The timestamp must be a finite, positive number. Both ends of the range are inclusive. If settings are still loading, the plugin checks events in the order it received them, using the age recorded when each event arrived.
-- Uses that timestamp to generate the filename in the local time of the device running Obsidian. If the note already has the generated name, it is left as is.
+- Checks the title at the time of the create event, including case and whitespace. The plugin skips the automatic rename if you rename or move the note before it starts.
+- Uses the file's creation timestamp (`ctime`) in the local time of the device running Obsidian. The plugin skips the rename if the timestamp is missing or invalid, or if the note already has the generated name.
 
 ## File name format
 
-Open **Settings → Auto Date Rename**, enter a Moment.js format in **File name format**, and check the `.md` preview. Click **Save** to apply the format and both creation time tolerances together to new Markdown notes. See the [Moment.js format tokens](https://momentjs.com/docs/#/displaying/format/).
+Open **Settings → Auto Date Rename**, enter a Moment.js format in **File name format**, and check the `.md` preview. Click **Save** to apply the format and the target title together. See the [Moment.js format tokens](https://momentjs.com/docs/#/displaying/format/).
 
 - `YYYY-MM-DD` produces `2026-11-20.md`.
 - `YYYYMMDD_HHmm` produces `20261120_1201.md`.
@@ -41,15 +41,16 @@ The normalized base filename can be up to **247 UTF-8 bytes**, leaving room for 
 
 To restore the default `YYYY-MM-DD_HH-mm-ss-SSS`, clear the field and click **Save**.
 
-## Creation time tolerance
+Saved date formats from earlier versions are carried over, including formats in the settings recovery file.
 
-- **Maximum creation age (seconds)** sets how far before the create event the recorded creation time can be. The default is **1 second**.
-- **Maximum future skew (seconds)** sets how far after the create event the recorded creation time can be. The default is **0 seconds**.
+## Target title
 
-Enter a non-negative number of seconds with up to three decimal places, such as `0.125` for 125 milliseconds. Enter `0` to allow no difference in that direction. The default applies when a setting is missing. Valid saved values are kept. Clear either field and click **Save** to restore its default.
+Enter the exact file name without `.md` in **Target title**. To restore the default, clear the field and click **Save**. The default is `無題のファイル` when Obsidian's display language is Japanese and `Untitled` in all other display languages.
+
+For example, with Obsidian set to Japanese, enter `Untitled` in **Target title** to rename new `Untitled.md` files. A new `Untitled 1.md`, `untitled.md`, or `Copy of Meeting Notes.md` keeps its original name with that setting.
 
 ## Notes
 
-The timestamp check helps skip older notes from Self-hosted LiveSync or other sync tools that preserve the original creation time. It is a best-effort filter. A synced note can still be renamed if its timestamp falls within the configured range, including when the sync tool assigns it a fresh timestamp. A local note can be skipped if its timestamp is older than the maximum creation age or farther ahead than the maximum future skew when its create event arrives.
+Files added by copying or syncing follow the same exact-title rule when Obsidian emits a create event. A matching file with an older creation timestamp is renamed using that timestamp.
 
 Please test the plugin in a test vault first. There is no function to rename existing notes in bulk. The behavior regarding new file events and conflicts with other plugins may vary depending on your environment.

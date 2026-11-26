@@ -1,27 +1,14 @@
 'use strict';
 
 const {
-  FileSystemAdapter, Platform, Plugin, PluginSettingTab, Setting, TFile, moment, normalizePath
+  FileSystemAdapter, Platform, Plugin, PluginSettingTab, Setting, TFile, getLanguage, moment, normalizePath
 } = require('obsidian');
 
 const DEFAULT_FILENAME_FORMAT = 'YYYY-MM-DD_HH-mm-ss-SSS';
 const DEFAULT_SETTINGS = {
   filenameFormat: DEFAULT_FILENAME_FORMAT,
-  maxCreationAgeMs: 1000,
-  maxFutureSkewMs: 0,
+  targetTitle: '',
 };
-const TOLERANCE_FIELDS = [
-  {
-    key: 'maxCreationAgeMs',
-    label: 'Maximum creation age (seconds)',
-    description: 'How far before the create event the creation time can be.',
-  },
-  {
-    key: 'maxFutureSkewMs',
-    label: 'Maximum future skew (seconds)',
-    description: 'How far after the create event the creation time can be.',
-  },
-];
 const MAX_BASENAME_BYTES = 247; // 255 bytes minus ".md" and "-9999".
 const RENAME_TIMEOUT_MS = 10_000;
 const utf8 = new TextEncoder();
@@ -46,36 +33,21 @@ function normalizeFormat(format) {
   return (typeof format === 'string' && format.trim()) || DEFAULT_FILENAME_FORMAT;
 }
 
-function isValidTolerance(milliseconds) {
-  return Number.isSafeInteger(milliseconds) && milliseconds >= 0;
+function getDefaultTargetTitle() {
+  // Older Obsidian versions expose the display language through local storage.
+  const language = getLanguage?.() ?? globalThis.localStorage?.getItem('language');
+  return language === 'ja' ? '無題のファイル' : 'Untitled';
 }
 
 function normalizeSettings(data) {
-  const settings = { ...DEFAULT_SETTINGS, filenameFormat: normalizeFormat(data?.filenameFormat) };
-  for (const { key } of TOLERANCE_FIELDS) {
-    if (isValidTolerance(data?.[key])) settings[key] = data[key];
-  }
-  return settings;
+  return {
+    filenameFormat: normalizeFormat(data?.filenameFormat),
+    targetTitle: typeof data?.targetTitle === 'string' ? data.targetTitle : DEFAULT_SETTINGS.targetTitle,
+  };
 }
 
 function settingsMatch(stored, requested) {
   return Object.keys(DEFAULT_SETTINGS).every((key) => stored?.[key] === requested[key]);
-}
-
-function formatSeconds(milliseconds) {
-  const digits = String(milliseconds).padStart(4, '0');
-  const seconds = digits.slice(0, -3);
-  const fraction = digits.slice(-3).replace(/0+$/, '');
-  return fraction ? `${seconds}.${fraction}` : seconds;
-}
-
-function parseSeconds(value, defaultMilliseconds) {
-  const trimmed = value.trim();
-  if (!trimmed) return defaultMilliseconds;
-  if (!/^\d*(?:\.\d{1,3})?$/.test(trimmed)) return NaN;
-  // Build the integer milliseconds as digits to avoid floating-point rounding.
-  const [seconds, fraction = ''] = trimmed.split('.');
-  return Number(seconds + fraction.padEnd(3, '0'));
 }
 
 function getFormattedFilename(date, format) {
@@ -117,10 +89,7 @@ class AutoDateRenameSettingTab extends PluginSettingTab {
     super(plugin.app, plugin);
     this.plugin = plugin;
     this.loadToken = loadToken;
-    this.draft = { filenameFormat: plugin.settings.filenameFormat };
-    for (const { key } of TOLERANCE_FIELDS) {
-      this.draft[key] = formatSeconds(plugin.settings[key]);
-    }
+    this.draft = { ...plugin.settings };
     this.feedback = '';
     this.saving = false;
   }
@@ -146,15 +115,10 @@ class AutoDateRenameSettingTab extends PluginSettingTab {
       .setDesc('Use Moment.js format tokens. Clear the field and save to restore the default.')
       .addText(addInput('filenameFormat', 'File name format', DEFAULT_FILENAME_FORMAT));
     const preview = containerEl.createDiv();
-    for (const { key, label, description } of TOLERANCE_FIELDS) {
-      const defaultSeconds = formatSeconds(DEFAULT_SETTINGS[key]);
-      new Setting(containerEl)
-        .setName(label)
-        .setDesc(`${description} Use up to three decimal places. ` +
-          `Clear the field and save to restore the default (${defaultSeconds} s).`)
-        .addText(addInput(key, label, defaultSeconds));
-      inputs[key].inputEl.setAttribute('inputmode', 'decimal');
-    }
+    new Setting(containerEl)
+      .setName('Target title')
+      .setDesc('Enter the exact title without .md. Clear the field and save to use the default for your display language.')
+      .addText(addInput('targetTitle', 'Target title', getDefaultTargetTitle()));
     new Setting(containerEl)
       .addButton((button) => {
         saveButton = button.setButtonText('Save').setCta().onClick(() => this.save());
@@ -162,28 +126,14 @@ class AutoDateRenameSettingTab extends PluginSettingTab {
 
     const status = containerEl.createDiv({ attr: { role: 'status' } });
     this.updateDisplay = () => {
-      const settings = { filenameFormat: normalizeFormat(this.draft.filenameFormat) };
+      const settings = normalizeSettings(this.draft);
       const { name, error } = getFormattedFilename(new Date(), settings.filenameFormat);
-      const errors = { filenameFormat: error && `File name format — ${error}` };
-      for (const { key, label } of TOLERANCE_FIELDS) {
-        const milliseconds = parseSeconds(this.draft[key], DEFAULT_SETTINGS[key]);
-        settings[key] = milliseconds;
-        if (Number.isNaN(milliseconds)) {
-          errors[key] = `${label} must be a non-negative number with up to three decimal places.`;
-        } else if (!isValidTolerance(milliseconds)) {
-          errors[key] = `${label} cannot exceed ${formatSeconds(Number.MAX_SAFE_INTEGER)} seconds.`;
-        }
-      }
-
-      const message = Object.values(errors).filter(Boolean).join(' ');
       preview.textContent = `Preview: ${name}.md`;
-      status.textContent = message || this.feedback;
-      for (const [key, input] of Object.entries(inputs)) {
-        input.inputEl.setAttribute('aria-invalid', String(Boolean(errors[key])));
-        input.setDisabled(this.saving);
-      }
-      saveButton.setDisabled(this.saving || Boolean(message));
-      return message ? undefined : settings;
+      status.textContent = error ? `File name format — ${error}` : this.feedback;
+      inputs.filenameFormat.inputEl.setAttribute('aria-invalid', String(Boolean(error)));
+      for (const input of Object.values(inputs)) input.setDisabled(this.saving);
+      saveButton.setDisabled(this.saving || Boolean(error));
+      return error ? undefined : settings;
     };
     this.updateDisplay();
   }
@@ -292,11 +242,17 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
     // Process one event at a time to avoid conflicting filenames.
     let renameQueue = Promise.resolve();
     const pendingCreates = [];
-    const queueRename = ({ file, ctime, age }, { filenameFormat, maxCreationAgeMs, maxFutureSkewMs }) => {
-      if (!(-maxFutureSkewMs <= age && age <= maxCreationAgeMs)) return;
+    const renameVersions = new WeakMap();
+    const { vault } = this.app;
+    const queueRename = (event, { filenameFormat, targetTitle }) => {
+      const { file, sourcePath, title, defaultTitle, renameVersion } = event;
+      if (title !== (targetTitle || defaultTitle)) return;
+      const sourceIsCurrent = () => this.loadToken === loadToken &&
+        renameVersions.get(file) === renameVersion && file.path === sourcePath &&
+        vault.getAbstractFileByPath(sourcePath) === file;
       renameQueue = renameQueue.then(async () => {
-        if (this.loadToken !== loadToken) return;
-        await this.renameNewNote(file, filenameFormat, loadToken, ctime);
+        if (!sourceIsCurrent()) return;
+        await this.renameNewNote(event, filenameFormat, sourceIsCurrent);
       }).catch((error) => console.error('[Auto Date Rename] Could not rename note:', error));
     };
     const settingsReady = this.loadSettings(loadToken);
@@ -305,15 +261,20 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
     // Registering after the layout is ready prevents accidental mass renaming.
     this.app.workspace.onLayoutReady(() => {
       if (this.loadToken !== loadToken) return;
-      this.registerEvent(this.app.vault.on('create', (file) => {
+      // A note moved away and back should also be left alone.
+      this.registerEvent(vault.on('rename', (file) => renameVersions.set(file, Symbol())));
+      this.registerEvent(vault.on('create', (file) => {
         if (this.loadToken !== loadToken) return;
         if (!(file instanceof TFile) || file.extension !== 'md') return;
 
-        // Capture the age at event delivery, even if settings are still loading.
         const ctime = file.stat?.ctime;
         if (!Number.isFinite(ctime) || ctime <= 0) return;
-        const age = Date.now() - ctime;
-        const event = { file, ctime, age };
+        const date = new Date(ctime);
+        if (Number.isNaN(date.getTime())) return;
+        const event = {
+          file, date, sourcePath: file.path, title: file.basename,
+          defaultTitle: getDefaultTargetTitle(), renameVersion: renameVersions.get(file),
+        };
         if (this.settings) queueRename(event, this.settings);
         else pendingCreates.push(event);
       }));
@@ -332,15 +293,8 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
     for (const release of this.renameReservations.values()) release();
   }
 
-  async renameNewNote(file, filenameFormat, loadToken, ctime) {
-    const { vault } = this.app;
-    const sourcePath = file.path;
-    const sourceIsCurrent = () => this.loadToken === loadToken &&
-      file.path === sourcePath && vault.getAbstractFileByPath(sourcePath) === file;
-    if (!sourceIsCurrent()) return;
-
+  async renameNewNote({ file, sourcePath, date }, filenameFormat, sourceIsCurrent) {
     const folder = file.parent && file.parent.path !== '/' ? file.parent.path : '';
-    const date = new Date(ctime);
     const { name, error } = getFormattedFilename(date, filenameFormat);
     const baseName = error ? formatLocalDateTime(date) : name;
 

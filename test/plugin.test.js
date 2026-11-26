@@ -14,10 +14,8 @@ const pluginId = 'obsidian-auto-date-rename';
 const pluginDir = `custom-config/plugins/${pluginId}`;
 const recoveryPath = `${pluginDir}/data.recovery.json`;
 const filenameLabel = 'File name format';
-const ageLabel = 'Maximum creation age (seconds)';
-const skewLabel = 'Maximum future skew (seconds)';
-const settings = (filenameFormat, maxCreationAgeMs = 1000, maxFutureSkewMs = 0) =>
-  ({ filenameFormat, maxCreationAgeMs, maxFutureSkewMs });
+const titleLabel = 'Target title';
+const settings = (filenameFormat, targetTitle = '') => ({ filenameFormat, targetTitle });
 const oldRecovery = JSON.stringify(settings('[Old]'));
 
 function normalizePath(path) {
@@ -59,9 +57,7 @@ class Plugin {
 }
 
 class TFile {
-  constructor(path, stat) {
-    this.path = path;
-    this.extension = path.split('.').at(-1);
+  constructor(stat) {
     this.stat = stat;
   }
 }
@@ -124,17 +120,23 @@ class Setting {
   }
 }
 
-function setup(storage = { data: { filenameFormat: '[Old]' } }, { lstat } = {}) {
+function setup(storage = { data: { filenameFormat: '[Old]' } },
+  { lstat, language = 'en', legacyLanguage } = {}) {
   const errors = [];
   const warnings = [];
   const timers = new Set();
   const module = {};
-  let now = creationTime;
   runInNewContext(source, {
     module,
     TextEncoder,
     Date: class extends Date {
-      static now() { return now; }
+      static now() { return creationTime; }
+    },
+    localStorage: {
+      getItem(key) {
+        assert.equal(key, 'language');
+        return legacyLanguage;
+      },
     },
     setTimeout(callback, delay) {
       assert.equal(delay, 10_000);
@@ -153,6 +155,7 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }, { lstat } = {}) 
         Setting,
         TFile,
         normalizePath,
+        getLanguage: legacyLanguage === undefined ? () => language : undefined,
         moment: () => ({ format: (format) => format.replace(/\[([^\]]*)\]/g, '$1') }),
       };
     },
@@ -176,6 +179,8 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }, { lstat } = {}) 
     file.parent = parents.get(folder);
     file.parent.children.push(file);
     file.path = path;
+    file.extension = path.split('.').at(-1);
+    file.basename = path.split('/').at(-1).slice(0, -(file.extension.length + 1));
     files.set(path, file);
     disk.add(path);
   }
@@ -242,13 +247,18 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }, { lstat } = {}) 
       },
     },
   };
+  function create(path, stat = { ctime: creationTime }) {
+    assert.equal(files.has(path), false, `File already exists at ${path}`);
+    const file = new TFile(stat);
+    attach(file, path);
+    for (const callback of listeners.create) callback(file);
+    return file;
+  }
+
   const plugin = new module.exports(app, storage);
   return {
     plugin, storage, errors, warnings, listeners, timers, disk, renamedPaths, move,
     createListeners: listeners.create,
-    setTime(timestamp) {
-      now = timestamp;
-    },
     expireRename() {
       assert.equal(timers.size, 1);
       const [callback] = timers;
@@ -263,11 +273,11 @@ function setup(storage = { data: { filenameFormat: '[Old]' } }, { lstat } = {}) 
       layoutReady = true;
       for (const callback of layoutCallbacks.splice(0)) callback();
     },
-    create(path, stat = { ctime: creationTime }) {
-      const file = new TFile(path, stat);
-      attach(file, path);
-      for (const callback of listeners.create) callback(file);
-      return file;
+    create,
+    createMatching(path) {
+      // Keep several distinct source names eligible in the same folder for queue tests.
+      plugin.settings.targetTitle = path.split('/').at(-1).slice(0, -3);
+      return create(path);
     },
   };
 }
@@ -278,137 +288,106 @@ async function openSettings(plugin) {
   return plugin.tab.containerEl;
 }
 
-test('saves the format and exact milliseconds and applies them immediately and after restart', async () => {
-  const { plugin, storage, create, finishLayout } = setup();
+test('uses the display-language default when the target is unspecified', async () => {
+  for (const [options, match, other] of [
+    [{ language: 'ja' }, '無題のファイル', 'Untitled'],
+    [{ language: 'en' }, 'Untitled', '無題のファイル'],
+    [{ language: 'de' }, 'Untitled', '無題のファイル'],
+    [{ legacyLanguage: 'ja' }, '無題のファイル', 'Untitled'],
+  ]) {
+    const { plugin, create, finishLayout } = setup({}, options);
+    const ui = await openSettings(plugin);
+    assert.deepEqual(Object.keys(ui.inputs), [filenameLabel, titleLabel]);
+    assert.equal(ui.inputs[titleLabel].value, '');
+    assert.equal(ui.inputs[titleLabel].placeholder, match);
+
+    finishLayout();
+    const matching = create(`${match}.md`);
+    const different = create(`${other}.md`);
+    await flushQueue();
+    assert.equal(matching.path, defaultFilename);
+    assert.equal(different.path, `${other}.md`);
+  }
+});
+
+test('saves the title verbatim with the format and applies both after reload', async () => {
+  const { plugin, storage, create, finishLayout } = setup(undefined, { language: 'ja' });
   const ui = await openSettings(plugin);
   ui.inputs[filenameLabel].change('[New]');
-  ui.inputs[ageLabel].change('0.125');
-  ui.inputs[skewLabel].change('1.001');
+  ui.inputs[titleLabel].change(' Meeting Notes ');
   assert.equal(ui.children[0].textContent, 'Preview: New.md');
   await ui.button.click();
 
-  assert.deepEqual(storage.data, settings('[New]', 125, 1001));
+  assert.deepEqual(storage.data, settings('[New]', ' Meeting Notes '));
   assert.equal(storage.recovery, undefined);
   assert.equal(ui.children[1].textContent, 'Settings saved.');
   finishLayout();
-  const oldest = create('Oldest.md', { ctime: creationTime - 125 });
-  const tooOld = create('Too old.md', { ctime: creationTime - 126 });
-  const furthest = create('Furthest.md', { ctime: creationTime + 1001 });
-  const tooFar = create('Too far.md', { ctime: creationTime + 1002 });
+  const matching = create(' Meeting Notes .md');
+  const trimmed = create('Meeting Notes.md');
+  const differentCase = create(' meeting Notes .md');
   await flushQueue();
-  assert.deepEqual([oldest.path, tooOld.path, furthest.path, tooFar.path], [
-    'New.md', 'Too old.md', 'New-01.md', 'Too far.md',
+  assert.deepEqual([matching.path, trimmed.path, differentCase.path], [
+    'New.md', 'Meeting Notes.md', ' meeting Notes .md',
   ]);
+
+  plugin.unload();
+  const reopened = setup(storage, { language: 'ja' });
+  const reopenedUi = await openSettings(reopened.plugin);
+  assert.equal(reopenedUi.inputs[filenameLabel].value, '[New]');
+  assert.equal(reopenedUi.inputs[titleLabel].value, ' Meeting Notes ');
+  reopened.finishLayout();
+  const note = reopened.create(' Meeting Notes .md');
+  await flushQueue();
+  assert.equal(note.path, 'New.md');
+});
+
+test('clearing the target restores the display-language default immediately and after reload', async () => {
+  const { plugin, storage, create, finishLayout } = setup({
+    data: settings('[Old]', 'Untitled'),
+  }, { language: 'ja' });
+  const ui = await openSettings(plugin);
+  ui.inputs[titleLabel].change('');
+  await ui.button.click();
+  assert.deepEqual(storage.data, settings('[Old]'));
+
+  finishLayout();
+  const japanese = create('無題のファイル.md');
+  const previous = create('Untitled.md');
+  await flushQueue();
+  assert.deepEqual([japanese.path, previous.path], ['Old.md', 'Untitled.md']);
 
   plugin.unload();
   const reopened = setup(storage);
   const reopenedUi = await openSettings(reopened.plugin);
-  assert.equal(reopenedUi.inputs[filenameLabel].value, '[New]');
-  assert.equal(reopenedUi.inputs[ageLabel].value, '0.125');
-  assert.equal(reopenedUi.inputs[skewLabel].value, '1.001');
+  assert.equal(reopenedUi.inputs[titleLabel].value, '');
   reopened.finishLayout();
-  const eligible = reopened.create('Eligible.md', { ctime: creationTime + 1001 });
-  const ineligible = reopened.create('Ineligible.md', { ctime: creationTime + 1002 });
+  const note = reopened.create('Untitled.md');
   await flushQueue();
-  assert.deepEqual([eligible.path, ineligible.path], ['New.md', 'Ineligible.md']);
+  assert.equal(note.path, 'Old.md');
 });
 
-test('zero allows only an exact timestamp and clearing either field restores its own default', async () => {
-  const { plugin, storage, create, finishLayout } = setup();
-  const ui = await openSettings(plugin);
-  const age = ui.inputs[ageLabel];
-  const skew = ui.inputs[skewLabel];
-  age.change('0');
-  skew.change('0.000');
-  await ui.button.click();
-  assert.deepEqual(storage.data, settings('[Old]', 0, 0));
-
-  const reopened = await openSettings(setup(storage).plugin);
-  assert.equal(reopened.inputs[ageLabel].value, '0');
-  assert.equal(reopened.inputs[skewLabel].value, '0');
-  finishLayout();
-  const exact = create('Exact.md');
-  const past = create('Past.md', { ctime: creationTime - 1 });
-  const future = create('Future.md', { ctime: creationTime + 1 });
-  await flushQueue();
-  assert.deepEqual([exact.path, past.path, future.path], ['Old.md', 'Past.md', 'Future.md']);
-
-  skew.change('2');
-  await ui.button.click();
-  assert.deepEqual(storage.data, settings('[Old]', 0, 2000));
-
-  age.change('');
-  await ui.button.click();
-  assert.deepEqual(storage.data, settings('[Old]', 1000, 2000));
-  skew.change('  ');
-  await ui.button.click();
-  assert.deepEqual(storage.data, settings('[Old]'));
-
-  const reset = await openSettings(setup(storage).plugin);
-  assert.equal(reset.inputs[ageLabel].value, '1');
-  assert.equal(reset.inputs[skewLabel].value, '0');
-});
-
-test('invalid tolerance inputs identify each field and block the shared save', async () => {
-  const { plugin, storage } = setup();
-  const ui = await openSettings(plugin);
-  const age = ui.inputs[ageLabel];
-  const skew = ui.inputs[skewLabel];
-  ui.inputs[filenameLabel].change('[New]');
-  for (const invalid of ['-1', '0.0001', '1e3', 'Infinity', '5s', '.', '9007199254740.992']) {
-    age.change(invalid);
-    assert.equal(age.attributes['aria-invalid'], 'true');
-    assert.equal(skew.attributes['aria-invalid'], 'false');
-    assert.ok(ui.children[1].textContent.includes(ageLabel));
-    assert.equal(ui.button.disabled, true);
-    await ui.button.click();
-    assert.deepEqual(storage.data, { filenameFormat: '[Old]' });
-    assert.equal(storage.recovery, undefined);
-  }
-
-  skew.change('-0.1');
-  assert.ok(ui.children[1].textContent.includes(ageLabel));
-  assert.ok(ui.children[1].textContent.includes(skewLabel));
-  age.change('9007199254740.991');
-  assert.equal(age.attributes['aria-invalid'], 'false');
-  assert.equal(skew.attributes['aria-invalid'], 'true');
-  assert.equal(ui.button.disabled, true);
-  skew.change('.125');
-  assert.equal(ui.button.disabled, false);
-  await ui.button.click();
-  assert.deepEqual(storage.data, settings('[New]', Number.MAX_SAFE_INTEGER, 125));
-  const reopened = await openSettings(setup(storage).plugin);
-  assert.equal(reopened.inputs[ageLabel].value, '9007199254740.991');
-});
-
-test('loads missing tolerances independently from old settings and recovery files', async () => {
-  const legacySettings = { filenameFormat: '[Legacy]' };
-  const { plugin, storage } = setup({ data: legacySettings });
-  const ui = await openSettings(plugin);
-  assert.equal(ui.inputs[ageLabel].value, '1');
-  assert.equal(ui.inputs[ageLabel].placeholder, '1');
-  assert.equal(ui.inputs[skewLabel].value, '0');
-  assert.equal(ui.inputs[skewLabel].placeholder, '0');
-  await ui.button.click();
-  assert.deepEqual(storage.data, settings('[Legacy]'));
-
-  for (const { source, expected } of [
-    { source: legacySettings, expected: settings('[Legacy]') },
-    { source: { ...legacySettings, maxCreationAgeMs: 0 }, expected: settings('[Legacy]', 0) },
-    { source: { ...legacySettings, maxFutureSkewMs: 125 }, expected: settings('[Legacy]', 1000, 125) },
-    { source: settings('[Legacy]', 5000, 2000), expected: settings('[Legacy]', 5000, 2000) },
-    { source: { ...legacySettings, maxCreationAgeMs: '0', maxFutureSkewMs: -1 },
-      expected: settings('[Legacy]') },
+test('inherits the date format from legacy settings and recovery files', async () => {
+  for (const legacy of [
+    { filenameFormat: '[Legacy]' },
+    { filenameFormat: '[Legacy]', maxCreationAgeMs: 0, maxFutureSkewMs: 125 },
   ]) {
-    const fromData = setup({ data: source }).plugin;
-    await fromData.onload();
-    assert.deepEqual({ ...fromData.settings }, expected);
-    const fromRecovery = setup({
-      data: settings('[Unconfirmed]', 6000, 4000),
-      recovery: JSON.stringify(source),
-    }).plugin;
-    await fromRecovery.onload();
-    assert.deepEqual({ ...fromRecovery.settings }, expected);
+    for (const storage of [
+      { data: legacy },
+      { data: settings('[Unconfirmed]', 'Other'), recovery: JSON.stringify(legacy) },
+    ]) {
+      const { plugin, create, finishLayout } = setup(storage, { language: 'ja' });
+      const ui = await openSettings(plugin);
+      assert.deepEqual({ ...plugin.settings }, settings('[Legacy]'));
+      assert.equal(ui.inputs[filenameLabel].value, '[Legacy]');
+      finishLayout();
+      const note = create('無題のファイル.md');
+      await flushQueue();
+      assert.equal(note.path, 'Legacy.md');
+
+      await ui.button.click();
+      assert.deepEqual(storage.data, settings('[Legacy]'));
+      assert.equal(storage.recovery, undefined);
+    }
   }
 });
 
@@ -453,9 +432,9 @@ test('retains the active format when a resolved write does not persist', async (
   assert.deepEqual(storage.data, { filenameFormat: '[Old]' });
 });
 
-test('requires an exact readback match for all three settings', async () => {
+test('requires an exact readback match for both settings', async () => {
   for (const mismatch of [
-    { filenameFormat: '[New] ' }, { maxCreationAgeMs: '125' }, { maxFutureSkewMs: undefined },
+    { filenameFormat: '[New] ' }, { targetTitle: 'New title ' }, { targetTitle: undefined },
   ]) {
     const { plugin, storage, errors } = setup();
     const ui = await openSettings(plugin);
@@ -464,8 +443,7 @@ test('requires an exact readback match for all three settings', async () => {
     };
 
     ui.inputs[filenameLabel].change('[New]');
-    ui.inputs[ageLabel].change('0.125');
-    ui.inputs[skewLabel].change('0');
+    ui.inputs[titleLabel].change('New title');
     await ui.button.click();
     assertSaveFailed(plugin, ui, errors);
     assert.equal(storage.recovery, oldRecovery);
@@ -520,7 +498,7 @@ test('uses the verified recovery after a short data.json write and repairs it on
   const recoveredUi = await openSettings(reopened.plugin);
   assert.equal(recoveredUi.inputs[filenameLabel].value, '[Old]');
   reopened.finishLayout();
-  const note = reopened.create('AfterEnable.md');
+  const note = reopened.create('Untitled.md');
   await flushQueue();
   assert.equal(note.path, 'Old.md');
 
@@ -536,8 +514,8 @@ test('uses the verified recovery after a short data.json write and repairs it on
 });
 
 test('keeps confirmed settings active until a verified save clears the recovery file', async () => {
-  const confirmed = settings('[Old]', 125, 750);
-  const requested = settings('[New]', 900, 0);
+  const confirmed = settings('[Old]', 'Confirmed');
+  const requested = settings('[New]', 'Requested');
   const { plugin, storage, errors, create, finishLayout } = setup({ data: confirmed });
   const ui = await openSettings(plugin);
   finishLayout();
@@ -546,23 +524,22 @@ test('keeps confirmed settings active until a verified save clears the recovery 
   const removing = deferred();
   adapter.remove = () => removing.promise;
   ui.inputs[filenameLabel].change('[New]');
-  ui.inputs[ageLabel].change('0.9');
-  ui.inputs[skewLabel].change('0');
+  ui.inputs[titleLabel].change('Requested');
   const saving = ui.button.click();
   await flushQueue();
 
   assert.equal(ui.button.disabled, true);
   assert.deepEqual(storage.data, requested);
   assert.equal(storage.recovery, JSON.stringify(confirmed));
-  const duringSave = create('During save.md', { ctime: creationTime + 750 });
+  const duringSave = create('Confirmed.md');
   await flushQueue();
   assert.equal(duringSave.path, 'Old.md');
   removing.reject(new Error('Recovery removal failed'));
   await saving;
   assertSaveFailed(plugin, ui, errors, confirmed);
-  const afterFailure = create('After failure.md', { ctime: creationTime - 126 });
+  const afterFailure = create('Requested.md');
   await flushQueue();
-  assert.equal(afterFailure.path, 'After failure.md');
+  assert.equal(afterFailure.path, 'Requested.md');
 
   const reopened = setup(storage);
   await reopened.plugin.onload();
@@ -572,10 +549,10 @@ test('keeps confirmed settings active until a verified save clears the recovery 
   await ui.button.click();
   assert.equal(storage.recovery, undefined);
   assert.deepEqual({ ...plugin.settings }, requested);
-  const afterRetry = create('After retry.md', { ctime: creationTime - 900 });
-  const future = create('Future.md', { ctime: creationTime + 1 });
+  const afterRetry = create('Inbox/Requested.md');
+  const oldTitle = create('Inbox/Confirmed.md');
   await flushQueue();
-  assert.deepEqual([afterRetry.path, future.path], ['New.md', 'Future.md']);
+  assert.deepEqual([afterRetry.path, oldTitle.path], ['Inbox/New.md', 'Inbox/Confirmed.md']);
 });
 
 function assertSaveFailed(plugin, ui, errors, confirmed = settings('[Old]')) {
@@ -586,33 +563,38 @@ function assertSaveFailed(plugin, ui, errors, confirmed = settings('[Old]')) {
   assert.equal(errors.length, 1);
 }
 
-test('startup checks the received ages in order against the loaded settings', async () => {
-  const { plugin, create, finishLayout, setTime } = setup();
+test('processes matching events received after layout readiness in order once settings load', async () => {
+  const { plugin, create, move, finishLayout, renamedPaths } = setup();
   const loading = deferred();
   plugin.loadData = () => loading.promise;
-  const renames = [];
-  plugin.renameNewNote = (file, format, _loadToken, ctime) => renames.push([file.path, format, ctime]);
   const startup = plugin.onload();
 
-  create('Existing.md');
+  const existing = create('Existing/Target.md');
   finishLayout();
-  create('Too old.md', { ctime: creationTime - 6001 });
-  const first = create('Oldest.md', { ctime: creationTime - 6000 });
-  setTime(creationTime + 100);
-  create('Too far.md', { ctime: creationTime + 3101 });
-  create('Furthest.md', { ctime: creationTime + 3100 });
+  const renamed = create('Renamed/Target.md');
+  move(renamed, 'Renamed/Manual.md');
+  const moved = create('Moved/Target.md');
+  move(moved, 'Other/Target.md');
+  const renamedToMatch = create('Incoming/Other.md');
+  move(renamedToMatch, 'Incoming/Target.md');
+  const movedBack = create('Returned/Target.md');
+  move(movedBack, 'Returned/Manual.md');
+  move(movedBack, 'Returned/Target.md');
+  const first = create('First/Target.md', { ctime: creationTime - 1000 });
+  const second = create('Second/Target.md');
   first.stat.ctime = creationTime;
-  await flushQueue();
-  assert.deepEqual(renames, []);
+  const manualPaths = [...renamedPaths];
 
-  setTime(creationTime + 30_000);
-  loading.resolve(settings('[Loaded]', 6000, 3000));
+  await flushQueue();
+  assert.deepEqual(renamedPaths, manualPaths);
+
+  loading.resolve(settings('YYYY-MM-DD_HH-mm-ss-SSS', 'Target'));
   await startup;
   await flushQueue();
-  assert.deepEqual(renames, [
-    ['Oldest.md', '[Loaded]', creationTime - 6000],
-    ['Furthest.md', '[Loaded]', creationTime + 3100],
-  ]);
+  assert.equal(first.path, 'First/2026-11-20_12-01-29-123.md');
+  assert.equal(second.path, `Second/${defaultFilename}`);
+  assert.equal(existing.path, 'Existing/Target.md');
+  assert.deepEqual(renamedPaths, [...manualPaths, first.path, second.path]);
 });
 
 test('disabling during load invalidates the layout callback and settings registration', async () => {
@@ -634,11 +616,11 @@ test('disabling while a note waits for settings discards that rename', async () 
   const loading = deferred();
   plugin.loadData = () => loading.promise;
   const renames = [];
-  plugin.renameNewNote = (file) => renames.push(file.path);
+  plugin.renameNewNote = ({ file }) => renames.push(file.path);
   const startup = plugin.onload();
 
   finishLayout();
-  create('Early.md');
+  create('Untitled.md');
   await flushQueue();
   plugin.unload();
   loading.resolve({ filenameFormat: '[Stale]' });
@@ -648,44 +630,65 @@ test('disabling while a note waits for settings discards that rename', async () 
 });
 
 test('queued notes use the settings at reception and are discarded on disable', async () => {
-  const { plugin, create, finishLayout, setTime } = setup({ data: settings('[Old]', 125, 0) });
+  const { plugin, create, finishLayout } = setup();
   const ui = await openSettings(plugin);
   finishLayout();
   const firstRename = deferred();
   const secondRename = deferred();
   const renames = [];
-  plugin.renameNewNote = (file, format) => {
-    renames.push([file.path, format]);
-    if (file.path === 'First.md') return firstRename.promise;
-    if (file.path === 'Second.md') return secondRename.promise;
+  plugin.renameNewNote = ({ sourcePath }, format) => {
+    renames.push([sourcePath, format]);
+    if (sourcePath === 'First/Untitled.md') return firstRename.promise;
+    if (sourcePath === 'Second/Untitled.md') return secondRename.promise;
   };
 
-  create('First.md');
-  create('Second.md', { ctime: creationTime - 125 });
-  create('Ineligible.md', { ctime: creationTime + 1 });
+  create('First/Untitled.md');
+  create('Second/Untitled.md');
+  create('New title.md');
   await flushQueue();
-  assert.deepEqual(renames, [['First.md', '[Old]']]);
+  assert.deepEqual(renames, [['First/Untitled.md', '[Old]']]);
 
   ui.inputs[filenameLabel].change('[New]');
-  ui.inputs[ageLabel].change('0');
-  ui.inputs[skewLabel].change('0.125');
+  ui.inputs[titleLabel].change('New title');
   await ui.button.click();
-  setTime(creationTime + 10_000);
-  create('Now too old.md', { ctime: creationTime + 9999 });
-  create('Discarded.md', { ctime: creationTime + 10_125 });
+  create('Third/Untitled.md');
+  create('Discarded/New title.md');
   firstRename.resolve();
   await flushQueue();
-  assert.deepEqual(renames, [['First.md', '[Old]'], ['Second.md', '[Old]']]);
+  assert.deepEqual(renames, [['First/Untitled.md', '[Old]'], ['Second/Untitled.md', '[Old]']]);
 
   plugin.unload();
   const reopened = await openSettings(plugin);
   assert.equal(reopened.inputs[filenameLabel].value, '[New]');
-  create('AfterEnable.md', { ctime: creationTime + 10_125 });
+  create('AfterEnable/New title.md');
   secondRename.resolve();
   await flushQueue();
   assert.deepEqual(renames, [
-    ['First.md', '[Old]'], ['Second.md', '[Old]'], ['AfterEnable.md', '[New]'],
+    ['First/Untitled.md', '[Old]'], ['Second/Untitled.md', '[Old]'], ['AfterEnable/New title.md', '[New]'],
   ]);
+});
+
+test('skips a matching note manually renamed or moved while waiting in the queue', async () => {
+  const { plugin, create, move, finishLayout, renamedPaths } = setup();
+  const calls = [];
+  plugin.app.fileManager.renameFile = (file, path) => {
+    calls.push([file, path]);
+    return Promise.resolve();
+  };
+  await plugin.onload();
+  finishLayout();
+  const first = create('First/Untitled.md');
+  const renamed = create('Second/Untitled.md');
+  const moved = create('Third/Untitled.md');
+  await flushQueue();
+
+  move(renamed, 'Second/Manual.md');
+  move(moved, 'Other/Untitled.md');
+  move(first, 'First/Old.md');
+  await flushQueue();
+
+  assert.deepEqual(calls, [[first, 'First/Old.md']]);
+  assert.deepEqual(renamedPaths, ['Second/Manual.md', 'Other/Untitled.md', 'First/Old.md']);
 });
 
 test('a save awaiting readback cannot replace settings of a later enable', async () => {
@@ -698,7 +701,7 @@ test('a save awaiting readback cannot replace settings of a later enable', async
   };
 
   ui.inputs[filenameLabel].change('[Stale]');
-  ui.inputs[ageLabel].change('0');
+  ui.inputs[titleLabel].change('Stale');
   const saving = ui.button.click();
   await flushQueue();
   plugin.unload();
@@ -708,12 +711,12 @@ test('a save awaiting readback cannot replace settings of a later enable', async
   assert.deepEqual({ ...plugin.settings }, settings('[Old]'));
   plugin.tab.display();
   plugin.tab.containerEl.inputs[filenameLabel].change('[Reloaded]');
-  plugin.tab.containerEl.inputs[skewLabel].change('0.25');
+  plugin.tab.containerEl.inputs[titleLabel].change('Reloaded');
   plugin.saveData = Plugin.prototype.saveData;
   await plugin.tab.containerEl.button.click();
-  readback.resolve(settings('[Stale]', 0));
+  readback.resolve(settings('[Stale]', 'Stale'));
   await saving;
-  assert.deepEqual({ ...plugin.settings }, settings('[Reloaded]', 1000, 250));
+  assert.deepEqual({ ...plugin.settings }, settings('[Reloaded]', 'Reloaded'));
   assert.equal(storage.recovery, undefined);
 });
 
@@ -727,62 +730,43 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-test('renames a recent note using its creation time and skips an older synced note', async () => {
+test('renames exact matches with old or future timestamps and preserves other new names', async () => {
   const { plugin, create, finishLayout, renamedPaths } = setup({});
   await plugin.onload();
   finishLayout();
 
-  const synced = create('Inbox/Synced.md', { ctime: creationTime - 1001 });
-  const local = create('Inbox/Untitled.md', { ctime: creationTime - 1000 });
+  const synced = create('Inbox/Untitled.md', { ctime: new Date(2026, 10, 19, 12, 1, 30, 123).getTime() });
+  const future = create('Other/Untitled.md', { ctime: creationTime + 1000 });
+  const untouchedPaths = [
+    'Inbox/Copy of Meeting Notes.md', 'Inbox/Untitled 1.md', 'Inbox/untitled.md',
+    'Inbox/Untitled .md', 'Inbox/Untitled.txt',
+  ];
+  const untouched = untouchedPaths.map((path) => create(path));
   await flushQueue();
 
-  assert.equal(synced.path, 'Inbox/Synced.md');
-  assert.equal(local.path, 'Inbox/2026-11-20_12-01-29-123.md');
-  assert.deepEqual(renamedPaths, [local.path]);
+  assert.equal(synced.path, 'Inbox/2026-11-19_12-01-30-123.md');
+  assert.equal(future.path, 'Other/2026-11-20_12-01-31-123.md');
+  assert.deepEqual(untouched.map(({ path }) => path), untouchedPaths);
+  assert.deepEqual(renamedPaths, [synced.path, future.path]);
 });
 
-test('skips missing, invalid, and excessively future creation times', async () => {
+test('skips matching notes with missing, invalid, or non-positive creation times', async () => {
   const { plugin, create, finishLayout, renamedPaths, errors } = setup();
   await plugin.onload();
   finishLayout();
 
   const invalidStats = [
     null, {}, { ctime: null }, { ctime: NaN }, { ctime: Infinity },
-    { ctime: String(creationTime) },
-    { ctime: creationTime + 1 },
+    { ctime: String(creationTime) }, { ctime: Number.MAX_SAFE_INTEGER },
+    { ctime: 0 }, { ctime: -1 },
   ];
-  const paths = invalidStats.map((_, index) => `Inbox/Note ${index}.md`);
+  const paths = invalidStats.map((_, index) => `Inbox/${index}/Untitled.md`);
   const notes = invalidStats.map((stat, index) => create(paths[index], stat));
   await flushQueue();
 
   assert.deepEqual(notes.map((file) => file.path), paths);
   assert.deepEqual(renamedPaths, []);
   assert.deepEqual(errors, []);
-});
-
-test('skips non-positive creation times even within the age window', async () => {
-  const { plugin, create, finishLayout, setTime, renamedPaths } = setup();
-  await plugin.onload();
-  finishLayout();
-  setTime(1);
-
-  create('Zero.md', { ctime: 0 });
-  create('Negative.md', { ctime: -1 });
-  await flushQueue();
-
-  assert.deepEqual(renamedPaths, []);
-});
-
-test('accepts both endpoints of the default creation-time window and suffixes collisions', async () => {
-  const { plugin, create, finishLayout, renamedPaths } = setup();
-  await plugin.onload();
-  finishLayout();
-
-  create('Oldest eligible.md', { ctime: creationTime - 1000 });
-  create('Exact timestamp.md');
-  await flushQueue();
-
-  assert.deepEqual(renamedPaths, ['Old.md', 'Old-01.md']);
 });
 
 test('uses the normalized preview name on disk and numbers collisions', async () => {
@@ -794,8 +778,10 @@ test('uses the normalized preview name on disk and numbers collisions', async ()
 
   finishLayout();
   const first = create('Inbox/Untitled.md');
-  const second = create('Inbox/Untitled 1.md');
-  const third = create('Inbox/Untitled 2.md');
+  await flushQueue();
+  const second = create('Inbox/Untitled.md');
+  await flushQueue();
+  const third = create('Inbox/Untitled.md');
   await flushQueue();
   assert.deepEqual([first.path, second.path, third.path], [
     'Inbox/New Note.md', 'Inbox/New Note-01.md', 'Inbox/New Note-02.md',
@@ -804,8 +790,8 @@ test('uses the normalized preview name on disk and numbers collisions', async ()
   assert.deepEqual(errors, []);
 });
 
-test('eligible notes stay queued past the age limit and continue while link updates are pending', async () => {
-  const { plugin, create, move, finishLayout, setTime, listeners, timers, errors } = setup();
+test('eligible notes continue while link updates are pending', async () => {
+  const { plugin, create, createMatching, move, finishLayout, listeners, timers, errors } = setup();
   const calls = [];
   const links = deferred();
   const lastRename = deferred();
@@ -818,12 +804,11 @@ test('eligible notes stay queued past the age limit and continue while link upda
   await plugin.onload();
   const other = create('Other.md');
   finishLayout();
-  const first = create('First.md');
-  const second = create('Second.md');
-  const third = create('Third.md');
+  const first = createMatching('First.md');
+  const second = createMatching('Second.md');
+  const third = createMatching('Third.md');
   await flushQueue();
   assert.deepEqual(calls, [[first, 'Old.md']]);
-  setTime(creationTime + 6000);
   move(other, 'Unrelated.md');
   await flushQueue();
   assert.equal(calls.length, 1);
@@ -832,7 +817,7 @@ test('eligible notes stay queued past the age limit and continue while link upda
   await flushQueue();
   assert.deepEqual([first.path, second.path, third.path], ['Old.md', 'Old-01.md', 'Old-02.md']);
   assert.equal(timers.size, 0);
-  assert.equal(listeners.rename.size, 0);
+  assert.equal(listeners.rename.size, 1);
   assert.equal(listeners.delete.size, 0);
   links.resolve();
   lastRename.reject(new Error('late link update failure'));
@@ -868,7 +853,8 @@ test('renames notes in a folder whose listing fails due to an unrelated broken s
   };
   finishLayout();
   const first = create('Inbox/Untitled.md');
-  const second = create('Inbox/Untitled 1.md');
+  await flushQueue();
+  const second = create('Inbox/Untitled.md');
   await flushQueue();
   assert.deepEqual([first.path, second.path], ['Inbox/Old.md', 'Inbox/Old-01.md']);
   assert.deepEqual(errors, []);
@@ -913,7 +899,7 @@ test('skips a desktop rename when the destination entry cannot be checked', asyn
 
 test('uses a case-sensitive check to distinguish the source from a case-only destination', async () => {
   for (const destinationExists of [false, true]) {
-    const { plugin, create, disk, finishLayout } = setup();
+    const { plugin, create, disk, finishLayout } = setup({ data: settings('[Old]', 'OLD') });
     await plugin.onload();
     if (destinationExists) disk.add('Inbox/Old.md');
     const adapter = plugin.app.vault.adapter;
@@ -958,7 +944,7 @@ test('retries when a rejected rename encounters a newly occupied destination', a
 
 test('a timeout advances the queue and reserves the destination until the source moves or is deleted', async () => {
   for (const change of ['move', 'delete']) {
-    const { plugin, create, move, remove, expireRename, finishLayout, listeners, timers, warnings } = setup();
+    const { plugin, createMatching, move, remove, expireRename, finishLayout, listeners, timers, warnings } = setup();
     const delayed = deferred();
     plugin.app.fileManager.renameFile = (file, path) => {
       if (file.path === 'Delayed.md') return delayed.promise;
@@ -967,30 +953,30 @@ test('a timeout advances the queue and reserves the destination until the source
     };
     await plugin.onload();
     finishLayout();
-    const first = create('Delayed.md');
-    const second = create('Second.md');
+    const first = createMatching('Delayed.md');
+    const second = createMatching('Second.md');
     await flushQueue();
     assert.equal(second.path, 'Second.md');
     expireRename();
     await flushQueue();
     assert.equal(second.path, 'Old-01.md');
     assert.equal(warnings.length, 1);
-    assert.equal(listeners.rename.size, 1);
+    assert.equal(listeners.rename.size, 2);
     assert.equal(listeners.delete.size, 1);
 
     if (change === 'move') move(first, 'Moved.md');
     else remove(first);
-    const third = create('Third.md');
+    const third = createMatching('Third.md');
     await flushQueue();
     assert.equal(third.path, 'Old.md');
     assert.equal(timers.size, 0);
-    assert.equal(listeners.rename.size, 0);
+    assert.equal(listeners.rename.size, 1);
     assert.equal(listeners.delete.size, 0);
   }
 });
 
 test('a rejection after timeout releases the destination and both listeners', async () => {
-  const { plugin, create, move, expireRename, finishLayout, listeners, errors } = setup();
+  const { plugin, createMatching, move, expireRename, finishLayout, listeners, errors } = setup();
   const delayed = deferred();
   plugin.app.fileManager.renameFile = async (file, path) => {
     if (file.path === 'Delayed.md') return delayed.promise;
@@ -998,20 +984,20 @@ test('a rejection after timeout releases the destination and both listeners', as
   };
   await plugin.onload();
   finishLayout();
-  const first = create('Delayed.md');
+  const first = createMatching('Delayed.md');
   await flushQueue();
   expireRename();
-  const second = create('Second.md');
+  const second = createMatching('Second.md');
   await flushQueue();
   assert.equal(second.path, 'Old-01.md');
-  assert.equal(listeners.rename.size, 1);
+  assert.equal(listeners.rename.size, 2);
   assert.equal(listeners.delete.size, 1);
 
   delayed.reject(new Error('late rename rejection'));
   await flushQueue();
-  assert.equal(listeners.rename.size, 0);
+  assert.equal(listeners.rename.size, 1);
   assert.equal(listeners.delete.size, 0);
-  const third = create('Third.md');
+  const third = createMatching('Third.md');
   await flushQueue();
   assert.equal(first.path, 'Delayed.md');
   assert.equal(third.path, 'Old.md');
@@ -1019,7 +1005,7 @@ test('a rejection after timeout releases the destination and both listeners', as
 });
 
 test('unload releases pending and timed-out renames and discards the queued notes', async () => {
-  const { plugin, create, finishLayout, expireRename, listeners, timers, warnings } = setup();
+  const { plugin, createMatching, finishLayout, expireRename, listeners, timers, warnings } = setup();
   const delayed = deferred();
   const calls = [];
   plugin.app.fileManager.renameFile = (file) => {
@@ -1028,13 +1014,13 @@ test('unload releases pending and timed-out renames and discards the queued note
   };
   await plugin.onload();
   finishLayout();
-  create('First.md');
-  create('Second.md');
-  create('Third.md');
+  createMatching('First.md');
+  createMatching('Second.md');
+  createMatching('Third.md');
   await flushQueue();
   expireRename();
   await flushQueue();
-  assert.equal(listeners.rename.size, 2);
+  assert.equal(listeners.rename.size, 3);
   assert.equal(timers.size, 1);
 
   plugin.unload();
@@ -1055,7 +1041,7 @@ test('skips a source moved during the disk check and discards checks from an ear
 
   const firstCheck = deferred();
   adapter.exists = () => firstCheck.promise;
-  const first = create('First.md');
+  const first = create('First/Untitled.md');
   await flushQueue();
   move(first, 'Moved.md');
   firstCheck.resolve(false);
@@ -1064,21 +1050,21 @@ test('skips a source moved during the disk check and discards checks from an ear
 
   const secondCheck = deferred();
   adapter.exists = () => secondCheck.promise;
-  const second = create('Second.md');
+  const second = create('Second/Untitled.md');
   await flushQueue();
   plugin.unload();
   adapter.exists = exists;
   await plugin.onload();
-  const third = create('Third.md');
+  const third = create('Untitled.md');
   secondCheck.resolve(false);
   await flushQueue();
-  assert.equal(second.path, 'Second.md');
+  assert.equal(second.path, 'Second/Untitled.md');
   assert.equal(third.path, 'Old.md');
   assert.deepEqual(renamedPaths, ['Moved.md', 'Old.md']);
 });
 
 test('skips renaming a note that already has the normalized name', async () => {
-  const storage = { data: { filenameFormat: '[New\u00a0Note]' } };
+  const storage = { data: settings('[New\u00a0Note]', 'New Note') };
   const { plugin, create, finishLayout, renamedPaths } = setup(storage);
   await plugin.onload();
   finishLayout();
