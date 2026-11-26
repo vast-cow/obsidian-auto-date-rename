@@ -2,7 +2,7 @@
 
 This plugin automatically renames new Markdown notes in Obsidian when their title exactly matches the configured target. It uses the note's creation date and time for the new name.
 
-Example: `2026-11-20_12-01-30-123.md`
+A note created at 12:01 local time on November 20, 2026, is named `20261120 1201.md` by default.
 
 ## Installation
 
@@ -25,7 +25,7 @@ Folder structure:
 
 - Listens for new `.md` files after Obsidian's workspace is ready. Existing notes are left as they are at startup.
 - Preserves the original folder structure.
-- If a file with the same name already exists, it appends a suffix like `-01`, `-02`, etc.
+- If a file with the same name already exists in the folder, it appends a suffix like `-01`, `-02`, etc. With the default format, notes created in the same folder and minute are named `20261120 1201.md`, `20261120 1201-01.md`, `20261120 1201-02.md`, and so on.
 - Renames files using Obsidian's `fileManager.renameFile()` (internal link updates depend on Obsidian's settings and behavior).
 - Checks the title at the time of the create event, including case and whitespace. The plugin skips the automatic rename if you rename or move the note before it starts.
 - Uses the file's creation timestamp (`ctime`) in the local time of the device running Obsidian. The plugin skips the rename if the timestamp is missing or invalid, or if the note already has the generated name.
@@ -34,12 +34,13 @@ Folder structure:
 
 Open **Settings → Auto Date Rename**, enter a Moment.js format in **File name format**, and check the `.md` preview. Click **Save** to apply the format and the target title together. See the [Moment.js format tokens](https://momentjs.com/docs/#/displaying/format/).
 
+- `YYYYMMDD HHmm` (default) produces `20261120 1201.md`.
 - `YYYY-MM-DD` produces `2026-11-20.md`.
 - `YYYYMMDD_HHmm` produces `20261120_1201.md`.
 
 The normalized base filename can be up to **247 UTF-8 bytes**, leaving room for `.md` and a collision suffix as long as `-9999` within the 255-byte filename limit. If a saved format produces a longer name, the plugin uses the default format for that note.
 
-To restore the default `YYYY-MM-DD_HH-mm-ss-SSS`, clear the field and click **Save**.
+To restore the default `YYYYMMDD HHmm`, clear the field and click **Save**.
 
 Saved date formats from earlier versions are carried over, including formats in the settings recovery file.
 

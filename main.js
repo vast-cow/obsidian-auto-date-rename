@@ -4,7 +4,7 @@ const {
   FileSystemAdapter, Platform, Plugin, PluginSettingTab, Setting, TFile, getLanguage, moment, normalizePath
 } = require('obsidian');
 
-const DEFAULT_FILENAME_FORMAT = 'YYYY-MM-DD_HH-mm-ss-SSS';
+const DEFAULT_FILENAME_FORMAT = 'YYYYMMDD HHmm';
 const DEFAULT_SETTINGS = {
   filenameFormat: DEFAULT_FILENAME_FORMAT,
   targetTitle: '',
@@ -18,15 +18,9 @@ function pad(number, width = 2) {
 }
 
 function formatLocalDateTime(date) {
-  return [
-    date.getFullYear(),
-    '-', pad(date.getMonth() + 1),
-    '-', pad(date.getDate()),
-    '_', pad(date.getHours()),
-    '-', pad(date.getMinutes()),
-    '-', pad(date.getSeconds()),
-    '-', pad(date.getMilliseconds(), 3)
-  ].join('');
+  const day = `${pad(date.getFullYear(), 4)}${pad(date.getMonth() + 1)}${pad(date.getDate())}`;
+  const time = `${pad(date.getHours())}${pad(date.getMinutes())}`;
+  return `${day} ${time}`;
 }
 
 function normalizeFormat(format) {
@@ -298,7 +292,7 @@ module.exports = class AutoDateRenamePlugin extends Plugin {
     const { name, error } = getFormattedFilename(date, filenameFormat);
     const baseName = error ? formatLocalDateTime(date) : name;
 
-    // If several notes are created simultaneously, suffix the duplicates.
+    // Suffix duplicates within the same folder.
     for (let index = 0; index < 10000; index++) {
       const suffix = index === 0 ? '' : `-${pad(index, 2)}`;
       const candidate = normalizePath(`${folder ? folder + '/' : ''}${baseName}${suffix}.md`);

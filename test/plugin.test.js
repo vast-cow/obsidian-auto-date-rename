@@ -9,7 +9,8 @@ const { runInNewContext } = require('node:vm');
 
 const source = readFileSync(join(__dirname, '../main.js'), 'utf8');
 const creationTime = new Date(2026, 10, 20, 12, 1, 30, 123).getTime();
-const defaultFilename = '2026-11-20_12-01-30-123.md';
+const defaultFormat = 'YYYYMMDD HHmm';
+const defaultFilename = '20261120 1201.md';
 const pluginId = 'obsidian-auto-date-rename';
 const pluginDir = `custom-config/plugins/${pluginId}`;
 const recoveryPath = `${pluginDir}/data.recovery.json`;
@@ -298,6 +299,7 @@ test('uses the display-language default when the target is unspecified', async (
     const { plugin, create, finishLayout } = setup({}, options);
     const ui = await openSettings(plugin);
     assert.deepEqual(Object.keys(ui.inputs), [filenameLabel, titleLabel]);
+    assert.equal(ui.inputs[filenameLabel].value, defaultFormat);
     assert.equal(ui.inputs[titleLabel].value, '');
     assert.equal(ui.inputs[titleLabel].placeholder, match);
 
@@ -364,6 +366,19 @@ test('clearing the target restores the display-language default immediately and 
   const note = reopened.create('Untitled.md');
   await flushQueue();
   assert.equal(note.path, 'Old.md');
+});
+
+test('saving an empty format restores the default and keeps the saved target title', async () => {
+  const { plugin, storage, create, finishLayout } = setup({ data: settings('[Old]', 'Target') });
+  const ui = await openSettings(plugin);
+  ui.inputs[filenameLabel].change('');
+  await ui.button.click();
+  assert.deepEqual(storage.data, settings(defaultFormat, 'Target'));
+
+  finishLayout();
+  const note = create('Target.md');
+  await flushQueue();
+  assert.equal(note.path, defaultFilename);
 });
 
 test('inherits the date format from legacy settings and recovery files', async () => {
@@ -580,7 +595,7 @@ test('processes matching events received after layout readiness in order once se
   const movedBack = create('Returned/Target.md');
   move(movedBack, 'Returned/Manual.md');
   move(movedBack, 'Returned/Target.md');
-  const first = create('First/Target.md', { ctime: creationTime - 1000 });
+  const first = create('First/Target.md', { ctime: creationTime - 60_000 });
   const second = create('Second/Target.md');
   first.stat.ctime = creationTime;
   const manualPaths = [...renamedPaths];
@@ -588,10 +603,10 @@ test('processes matching events received after layout readiness in order once se
   await flushQueue();
   assert.deepEqual(renamedPaths, manualPaths);
 
-  loading.resolve(settings('YYYY-MM-DD_HH-mm-ss-SSS', 'Target'));
+  loading.resolve(settings(defaultFormat, 'Target'));
   await startup;
   await flushQueue();
-  assert.equal(first.path, 'First/2026-11-20_12-01-29-123.md');
+  assert.equal(first.path, 'First/20261120 1200.md');
   assert.equal(second.path, `Second/${defaultFilename}`);
   assert.equal(existing.path, 'Existing/Target.md');
   assert.deepEqual(renamedPaths, [...manualPaths, first.path, second.path]);
@@ -744,8 +759,8 @@ test('renames exact matches with old or future timestamps and preserves other ne
   const untouched = untouchedPaths.map((path) => create(path));
   await flushQueue();
 
-  assert.equal(synced.path, 'Inbox/2026-11-19_12-01-30-123.md');
-  assert.equal(future.path, 'Other/2026-11-20_12-01-31-123.md');
+  assert.equal(synced.path, 'Inbox/20261119 1201.md');
+  assert.equal(future.path, `Other/${defaultFilename}`);
   assert.deepEqual(untouched.map(({ path }) => path), untouchedPaths);
   assert.deepEqual(renamedPaths, [synced.path, future.path]);
 });
@@ -767,6 +782,27 @@ test('skips matching notes with missing, invalid, or non-positive creation times
   assert.deepEqual(notes.map((file) => file.path), paths);
   assert.deepEqual(renamedPaths, []);
   assert.deepEqual(errors, []);
+});
+
+test('numbers default filenames within the same folder and minute', async () => {
+  const { plugin, create, finishLayout } = setup({});
+  await plugin.onload();
+  finishLayout();
+
+  const first = create('Inbox/Untitled.md');
+  await flushQueue();
+  const second = create('Inbox/Untitled.md', { ctime: creationTime + 1_000 });
+  await flushQueue();
+  const third = create('Inbox/Untitled.md', { ctime: creationTime + 29_000 });
+  const otherFolder = create('Other/Untitled.md');
+  await flushQueue();
+  const nextMinute = create('Inbox/Untitled.md', { ctime: creationTime + 30_000 });
+  await flushQueue();
+
+  assert.deepEqual([first.path, second.path, third.path, otherFolder.path, nextMinute.path], [
+    `Inbox/${defaultFilename}`, 'Inbox/20261120 1201-01.md', 'Inbox/20261120 1201-02.md',
+    `Other/${defaultFilename}`, 'Inbox/20261120 1202.md',
+  ]);
 });
 
 test('uses the normalized preview name on disk and numbers collisions', async () => {
